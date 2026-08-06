@@ -30,6 +30,47 @@ metrics:
   address: 127.0.0.1:8081
 
 #
+# Runner cache configuration. This is used to run a bounded, disk-persistent
+# cache component alongside the server, reachable from VMs over the CNI
+# bridge. The cache serves public content only and has no credential
+# configuration by design.
+#
+cache:
+  #
+  # Enable the runner cache.
+  #
+  # Default: false
+  #
+  enabled: false
+
+  #
+  # The address to listen on for HTTP requests. Must include a port and must
+  # be an address reachable from the CNI bridge (e.g. the bridge gateway
+  # 192.168.128.1:5050). There is no auto-detection.
+  #
+  # Required: true (when enabled)
+  #
+  bind_address: 192.168.128.1:5050
+
+  #
+  # The maximum amount of disk space the cache may use. Size suffixes follow
+  # Docker's `--memory` convention: every suffix is interpreted as powers of 1024,
+  # so `GB`, `GiB` and `G` are all synonyms (50GB == 50GiB == 50G == 53687091200
+  # bytes). A bare number with no suffix is a raw byte count (max_size: 50 means
+  # fifty bytes, not fifty gigabytes).
+  #
+  # Required: true (when enabled)
+  #
+  max_size: 50GB
+
+  #
+  # The directory where cache contents are stored on disk.
+  #
+  # Default: /var/lib/fireactions/cache
+  #
+  data_dir: /var/lib/fireactions/cache
+
+#
 # GitHub configuration.
 #
 github:

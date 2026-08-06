@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/hostinger/fireactions/server/cache"
 	"gopkg.in/yaml.v3"
 )
 
@@ -13,6 +14,7 @@ type Config struct {
 	BindAddress      string            `yaml:"bind_address" validate:"required,hostname_port"`
 	Containerd       *ContainerdConfig `yaml:"containerd" validate:"required"`
 	Metrics          *MetricsConfig    `yaml:"metrics"`
+	Cache            *cache.Config     `yaml:"cache"`
 	BasicAuthEnabled bool              `yaml:"basic_auth_enabled" validate:""`
 	BasicAuthUsers   map[string]string `yaml:"basic_auth_users" validate:"required_if=basic_auth_enabled true"`
 	GitHub           *GitHubConfig     `yaml:"github" validate:"required"`
@@ -65,6 +67,7 @@ func DefaultConfig() *Config {
 		BindAddress:      ":8080",
 		Containerd:       &ContainerdConfig{Address: "/run/containerd/containerd.sock", Namespace: "fireactions"},
 		Metrics:          &MetricsConfig{Enabled: true, Address: ":8081"},
+		Cache:            cache.DefaultConfig(),
 		BasicAuthEnabled: false,
 		BasicAuthUsers:   map[string]string{},
 		GitHub:           &GitHubConfig{AppPrivateKey: "", AppID: 0},
@@ -109,5 +112,13 @@ func (c *Config) Load() error {
 
 // Validate validates the configuration.
 func (c *Config) Validate() error {
-	return validator.New().Struct(c)
+	if err := validator.New().Struct(c); err != nil {
+		return err
+	}
+
+	if c.Cache != nil {
+		return c.Cache.Validate()
+	}
+
+	return nil
 }
