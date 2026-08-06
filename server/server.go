@@ -13,6 +13,7 @@ import (
 	"github.com/hostinger/fireactions"
 	"github.com/hostinger/fireactions/helper/github"
 	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	"github.com/hostinger/fireactions/server/cache"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
@@ -27,6 +28,7 @@ type Server struct {
 	pools         map[string]*Pool
 	grpcServer    *grpc.Server
 	metricsServer *http.Server
+	cacheManager  *cache.Manager
 	github        *github.Client
 	containerd    *containerd.Client
 	imageManager  *imageManager
@@ -36,6 +38,32 @@ type Server struct {
 	version       string        // Version info for GetVersion RPC
 	commit        string
 	date          string
+}
+
+// guardedPorts derives the ports that the cache's firewall guard (plan 01-02)
+// must block from guest access over the CNI bridge: the server's own gRPC
+// port, and its metrics port when metrics is enabled. Ports are always
+// derived from the live config — never hardcoded — since operators can (and
+// do, per docs/reference/configuration.md) override both bind_address and
+// metrics.address.
+func guardedPorts(config *Config) ([]string, error) {
+	_, grpcPort, err := net.SplitHostPort(config.BindAddress)
+	if err != nil {
+		return nil, fmt.Errorf("cache: parsing bind_address %q: %w", config.BindAddress, err)
+	}
+
+	ports := []string{grpcPort}
+
+	if config.Metrics != nil && config.Metrics.Enabled {
+		_, metricsPort, err := net.SplitHostPort(config.Metrics.Address)
+		if err != nil {
+			return nil, fmt.Errorf("cache: parsing metrics.address %q: %w", config.Metrics.Address, err)
+		}
+
+		ports = append(ports, metricsPort)
+	}
+
+	return ports, nil
 }
 
 // Opt is a functional option for Server.
@@ -119,6 +147,24 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 		s.metricsServer = metricsServer
 	}
 
+	// Setup cache component — construction only, no I/O. A cache problem must
+	// never prevent the server from being constructed (D-07): log and
+	// continue without it. Firewall install (01-02) and net.Listen happen
+	// later, in the fail-closed Start step inside Run.
+	if config.Cache != nil && config.Cache.Enabled {
+		ports, err := guardedPorts(config)
+		if err != nil {
+			s.logger.Error().Err(err).Msg("Failed to create cache, continuing without it")
+		} else {
+			cacheManager, err := cache.New(config.Cache, ports, cache.WithLogger(s.logger))
+			if err != nil {
+				s.logger.Error().Err(err).Msg("Failed to create cache, continuing without it")
+			} else {
+				s.cacheManager = cacheManager
+			}
+		}
+	}
+
 	return s, nil
 }
 
@@ -155,6 +201,16 @@ func (s *Server) Run(ctx context.Context) error {
 		errGroup.Go(func() error { return s.metricsServer.Serve(metricsListener) })
 	}
 
+	if s.cacheManager != nil {
+		if err := s.cacheManager.Start(ctx); err != nil {
+			s.logger.Error().Err(err).Msg("Failed to start cache, continuing without it")
+			s.cacheManager = nil
+		} else {
+			s.logger.Info().Str("address", s.cacheManager.Addr().String()).Msg("Cache started")
+			errGroup.Go(func() error { return s.cacheManager.Run(ctx) })
+		}
+	}
+
 	go func() {
 		<-ctx.Done()
 		fmt.Println()
@@ -170,6 +226,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
+
+		if s.cacheManager != nil {
+			s.cacheManager.Shutdown(cancelCtx)
+		}
 
 		if s.config.Metrics.Enabled {
 			_ = s.metricsServer.Shutdown(cancelCtx)
