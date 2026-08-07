@@ -2,6 +2,7 @@ package cache
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -285,4 +286,230 @@ func TestStore_NotRegularFile_ErrorDoesNotClaimMissing(t *testing.T) {
 	assert.Nil(t, fi)
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, os.ErrNotExist))
+}
+
+// writeSweepTestFile writes size bytes of real content at kind/key with an
+// explicit mtime, bypassing Put so tests can control mtime deterministically
+// (real wall-clock ordering between fast successive writes can collide at
+// filesystem mtime resolution).
+func writeSweepTestFile(t *testing.T, s *Store, kind, key string, size int, mtime time.Time) string {
+	t.Helper()
+
+	full, err := s.Path(kind, key)
+	require.NoError(t, err)
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o750))
+	require.NoError(t, os.WriteFile(full, []byte(strings.Repeat("a", size)), 0o600))
+	require.NoError(t, os.Chtimes(full, mtime, mtime))
+
+	return full
+}
+
+func TestStore_Sweep_UnderCap_NoEviction(t *testing.T) {
+	s := newTestStore(t)
+
+	base := time.Now().Add(-time.Hour)
+	paths := make([]string, 5)
+
+	for i := range paths {
+		paths[i] = writeSweepTestFile(t, s, "gomod", fmt.Sprintf("file-%d", i), 1000, base.Add(time.Duration(i)*time.Minute))
+	}
+
+	result, err := s.Sweep(100000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(5000), result.BytesBefore)
+	assert.Equal(t, int64(5000), result.BytesAfter)
+	assert.Equal(t, 0, result.Evicted)
+
+	for _, p := range paths {
+		_, statErr := os.Stat(p)
+		assert.NoError(t, statErr)
+	}
+}
+
+func TestStore_Sweep_OverCap_EvictsOldestDownToLowWater(t *testing.T) {
+	s := newTestStore(t)
+
+	base := time.Now().Add(-time.Hour)
+	names := make([]string, 10)
+
+	for i := range names {
+		name := fmt.Sprintf("file-%02d", i)
+		names[i] = name
+		writeSweepTestFile(t, s, "gomod", name, 1000, base.Add(time.Duration(i)*time.Minute))
+	}
+
+	result, err := s.Sweep(5000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10000), result.BytesBefore)
+	assert.LessOrEqual(t, result.BytesAfter, int64(4500))
+	assert.Equal(t, 6, result.Evicted)
+	assert.Equal(t, int64(4000), result.BytesAfter)
+
+	// The 6 oldest files must be gone; the 4 newest must survive — named
+	// explicitly so an off-by-one in the sort direction can't pass.
+	for i := range 6 {
+		full, pathErr := s.Path("gomod", names[i])
+		require.NoError(t, pathErr)
+		_, statErr := os.Stat(full)
+		assert.True(t, os.IsNotExist(statErr), "expected %s evicted", names[i])
+	}
+
+	for i := 6; i < 10; i++ {
+		full, pathErr := s.Path("gomod", names[i])
+		require.NoError(t, pathErr)
+		_, statErr := os.Stat(full)
+		assert.NoError(t, statErr, "expected %s to survive", names[i])
+	}
+}
+
+// TestStore_Sweep_EvictionOrderByMtimeNotWriteOrder pins eviction order to
+// mtime, not filesystem-visit/write order: the file written first is given
+// the newest mtime and must be the one that survives.
+func TestStore_Sweep_EvictionOrderByMtimeNotWriteOrder(t *testing.T) {
+	s := newTestStore(t)
+
+	now := time.Now()
+
+	writeSweepTestFile(t, s, "gomod", "first", 1000, now)
+	writeSweepTestFile(t, s, "gomod", "second", 1000, now.Add(-2*time.Hour))
+	writeSweepTestFile(t, s, "gomod", "third", 1000, now.Add(-time.Hour))
+
+	result, err := s.Sweep(2000) // low-water target = 1800
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Evicted)
+
+	fullFirst, err := s.Path("gomod", "first")
+	require.NoError(t, err)
+	_, statErr := os.Stat(fullFirst)
+	assert.NoError(t, statErr, "expected the file with the newest mtime (written first) to survive")
+
+	fullSecond, err := s.Path("gomod", "second")
+	require.NoError(t, err)
+	_, statErr = os.Stat(fullSecond)
+	assert.True(t, os.IsNotExist(statErr))
+
+	fullThird, err := s.Path("gomod", "third")
+	require.NoError(t, err)
+	_, statErr = os.Stat(fullThird)
+	assert.True(t, os.IsNotExist(statErr))
+}
+
+// TestStore_Sweep_SpansKindSubdirectories is D-08: all kind subdirectories
+// are one pool against a single global cap, not per-kind quotas.
+func TestStore_Sweep_SpansKindSubdirectories(t *testing.T) {
+	s := newTestStore(t)
+
+	base := time.Now().Add(-time.Hour)
+	writeSweepTestFile(t, s, "gomod", "old", 1000, base)
+	writeSweepTestFile(t, s, "docker", "new", 1000, base.Add(time.Hour))
+
+	result, err := s.Sweep(1500) // low-water target = 1350
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Evicted)
+	assert.LessOrEqual(t, result.BytesAfter, int64(1350))
+
+	fullOld, err := s.Path("gomod", "old")
+	require.NoError(t, err)
+	_, statErr := os.Stat(fullOld)
+	assert.True(t, os.IsNotExist(statErr), "expected the oldest file across kind subdirectories to be evicted")
+
+	fullNew, err := s.Path("docker", "new")
+	require.NoError(t, err)
+	_, statErr = os.Stat(fullNew)
+	assert.NoError(t, statErr, "expected the newer file in a different kind subdirectory to survive")
+}
+
+// TestStore_Sweep_ReapsOrphanedTempFiles is Pitfall/Pattern 3: a stale
+// ".tmp-*" scratch file from an interrupted Put is reaped once older than
+// tempFileMaxAge; a fresh one survives, and neither ever counts as usage.
+func TestStore_Sweep_ReapsOrphanedTempFiles(t *testing.T) {
+	s := newTestStore(t)
+
+	kindDir := filepath.Join(s.dataDir, "gomod")
+	require.NoError(t, os.MkdirAll(kindDir, 0o750))
+
+	oldTmp := filepath.Join(kindDir, ".tmp-abc")
+	require.NoError(t, os.WriteFile(oldTmp, []byte("orphaned"), 0o600))
+	oldTime := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(oldTmp, oldTime, oldTime))
+
+	freshTmp := filepath.Join(kindDir, ".tmp-xyz")
+	require.NoError(t, os.WriteFile(freshTmp, []byte("in-progress"), 0o600))
+
+	result, err := s.Sweep(100000)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.TempReaped)
+	assert.Equal(t, int64(0), result.BytesBefore)
+
+	_, statErr := os.Stat(oldTmp)
+	assert.True(t, os.IsNotExist(statErr), "expected the 2-hour-old temp file to be reaped")
+
+	_, statErr = os.Stat(freshTmp)
+	assert.NoError(t, statErr, "expected the fresh temp file to survive")
+}
+
+// TestStore_Sweep_PrunesEmptyDirectories asserts an emptied nested kind
+// directory is removed, but dataDir itself is never removed.
+func TestStore_Sweep_PrunesEmptyDirectories(t *testing.T) {
+	s := newTestStore(t)
+
+	base := time.Now().Add(-time.Hour)
+	writeSweepTestFile(t, s, "gomod", "nested/only-file", 1000, base)
+
+	nestedDir := filepath.Join(s.dataDir, "gomod", "nested")
+	_, err := os.Stat(nestedDir)
+	require.NoError(t, err)
+
+	result, err := s.Sweep(0) // force full eviction: low-water target is 0
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Evicted)
+
+	_, err = os.Stat(nestedDir)
+	assert.True(t, os.IsNotExist(err), "expected the emptied nested kind directory to be pruned")
+
+	_, err = os.Stat(s.dataDir)
+	assert.NoError(t, err, "data_dir itself must never be removed")
+}
+
+func TestStore_Sweep_EmptyStore(t *testing.T) {
+	s := newTestStore(t)
+
+	result, err := s.Sweep(1000)
+	require.NoError(t, err)
+	assert.Equal(t, SweepResult{BytesBefore: 0, BytesAfter: 0, Evicted: 0, TempReaped: 0}, result)
+}
+
+func TestStore_Sweep_DataDirDeleted_ReturnsErrorNotPanic(t *testing.T) {
+	s := newTestStore(t)
+
+	require.NoError(t, os.RemoveAll(s.dataDir))
+
+	assert.NotPanics(t, func() {
+		_, err := s.Sweep(1000)
+		assert.Error(t, err)
+	})
+}
+
+// TestStore_Sweep_NeverFollowsSymlinkOutsideDataDir places a symlink inside
+// dataDir pointing at a file outside it: Sweep must never account for or
+// delete the symlink target, even under an aggressively low cap.
+func TestStore_Sweep_NeverFollowsSymlinkOutsideDataDir(t *testing.T) {
+	s := newTestStore(t)
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "secret.txt")
+	require.NoError(t, os.WriteFile(outsideFile, []byte("do not touch"), 0o600))
+
+	linkDir := filepath.Join(s.dataDir, "gomod")
+	require.NoError(t, os.MkdirAll(linkDir, 0o750))
+	linkPath := filepath.Join(linkDir, "escape")
+	require.NoError(t, os.Symlink(outsideFile, linkPath))
+
+	result, err := s.Sweep(0) // force aggressive eviction
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.Evicted) // the symlink itself is never accounted or evicted
+
+	_, statErr := os.Stat(outsideFile)
+	assert.NoError(t, statErr, "expected the symlink target outside data_dir to survive")
 }

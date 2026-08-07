@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -227,4 +228,202 @@ func (s *Store) Usage() (int64, error) {
 	}
 
 	return total, nil
+}
+
+// SweepResult summarizes what a single Sweep pass did.
+type SweepResult struct {
+	BytesBefore int64
+	BytesAfter  int64
+	Evicted     int
+	TempReaped  int
+}
+
+const (
+	// sweepLowWaterPercent is the fraction of maxBytes Sweep targets once
+	// usage is found to exceed the cap (D-09: evict down to roughly 90
+	// percent of the cap, not all the way to zero, so overshoot between
+	// sweeps stays cheap to absorb on the next pass).
+	sweepLowWaterPercent = 90
+
+	// tempFileMaxAge is how long a ".tmp-*" scratch file may sit on disk
+	// before Sweep treats it as orphaned by an interrupted Put and reaps it.
+	tempFileMaxAge = 1 * time.Hour
+)
+
+// tempFilePrefix identifies Put's own scratch files (see os.CreateTemp in
+// Put) so Sweep can reap them separately from real cache content.
+const tempFilePrefix = ".tmp-"
+
+// sweepFile is a regular-file candidate collected during Sweep's walk.
+type sweepFile struct {
+	path    string
+	size    int64
+	modTime time.Time
+}
+
+// Sweep walks dataDir once, measuring total usage across every kind
+// subdirectory as a single pool (D-08 — no per-kind quotas), and evicts
+// least-recently-used content down to sweepLowWaterPercent of maxBytes when
+// usage exceeds it. It also reaps orphaned ".tmp-*" scratch files older than
+// tempFileMaxAge and prunes any kind directory left empty by eviction —
+// dataDir itself is never removed. A single failed deletion is logged at
+// Warn and skipped rather than aborting the pass, so one unlink error can't
+// leave the cache permanently over cap.
+func (s *Store) Sweep(maxBytes int64) (SweepResult, error) {
+	files, dirs, tempReaped, err := s.sweepCollect()
+	if err != nil {
+		return SweepResult{}, err
+	}
+
+	var bytesBefore int64
+	for _, f := range files {
+		bytesBefore += f.size
+	}
+
+	result := SweepResult{BytesBefore: bytesBefore, BytesAfter: bytesBefore, Evicted: 0, TempReaped: tempReaped}
+
+	if bytesBefore > maxBytes {
+		target := maxBytes * sweepLowWaterPercent / 100
+		result.BytesAfter, result.Evicted = s.evictLRU(files, bytesBefore, target)
+	}
+
+	pruneEmptyDirs(dirs)
+
+	return result, nil
+}
+
+// sweepCollect walks dataDir once, returning every regular cache-content
+// file plus every directory found (dataDir itself excluded from dirs), and
+// reaping any ".tmp-*" scratch file older than tempFileMaxAge along the way.
+// Non-regular entries (symlinks, devices, ...) are skipped entirely: d.Type()
+// reflects the raw directory-entry type from the walk itself, not a followed
+// stat, so this check alone keeps a symlink escape out of consideration for
+// accounting or deletion.
+func (s *Store) sweepCollect() ([]sweepFile, []string, int, error) {
+	var (
+		files      []sweepFile
+		dirs       []string
+		tempReaped int
+	)
+
+	walkErr := filepath.WalkDir(s.dataDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return s.sweepEntryErr(p, err)
+		}
+
+		if d.IsDir() {
+			if p != s.dataDir {
+				dirs = append(dirs, p)
+			}
+
+			return nil
+		}
+
+		if !d.Type().IsRegular() {
+			return nil
+		}
+
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return s.sweepEntryErr(p, infoErr)
+		}
+
+		if strings.HasPrefix(filepath.Base(p), tempFilePrefix) {
+			if s.reapTempFileIfStale(p, info) {
+				tempReaped++
+			}
+
+			return nil
+		}
+
+		files = append(files, sweepFile{path: p, size: info.Size(), modTime: info.ModTime()})
+
+		return nil
+	})
+	if walkErr != nil {
+		return nil, nil, 0, fmt.Errorf("cache: store: sweep: %w", walkErr)
+	}
+
+	return files, dirs, tempReaped, nil
+}
+
+// sweepEntryErr classifies an error found while visiting p during the walk:
+// dataDir vanishing entirely is fatal (propagated), an individual entry
+// vanishing between the walk and a stat is tolerated (a concurrent eviction
+// or Put can remove/replace a file mid-walk), and anything else is
+// propagated as-is.
+func (s *Store) sweepEntryErr(p string, err error) error {
+	if p == s.dataDir {
+		return err
+	}
+
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+
+	return err
+}
+
+// reapTempFileIfStale deletes p if it is a ".tmp-*" scratch file older than
+// tempFileMaxAge, returning true if it was reaped. A deletion failure is
+// logged at Warn and treated as not-reaped, not returned — one unlink error
+// must not abort the sweep.
+func (s *Store) reapTempFileIfStale(p string, info fs.FileInfo) bool {
+	if time.Since(info.ModTime()) <= tempFileMaxAge {
+		return false
+	}
+
+	if err := os.Remove(p); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			s.logger.Warn().Err(err).Str("path", p).Msg("cache: store: sweep: failed to reap orphaned temp file")
+		}
+
+		return false
+	}
+
+	return true
+}
+
+// evictLRU sorts files by mtime ascending and deletes from the front until
+// the running total is at or below target, returning the bytes remaining
+// and the count evicted. A single failed deletion is logged at Warn and
+// skipped, not returned — one unlink error must not abort the pass.
+func (s *Store) evictLRU(files []sweepFile, bytesBefore, target int64) (int64, int) {
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
+
+	running := bytesBefore
+	evicted := 0
+
+	for _, f := range files {
+		if running <= target {
+			break
+		}
+
+		if err := os.Remove(f.path); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				s.logger.Warn().Err(err).Str("path", f.path).Msg("cache: store: sweep: failed to evict")
+			}
+
+			continue
+		}
+
+		running -= f.size
+		evicted++
+
+		s.logger.Debug().Str("path", f.path).Int64("size", f.size).Msg("cache: store: sweep: evicted")
+	}
+
+	return running, evicted
+}
+
+// pruneEmptyDirs removes any directory in dirs that is now empty, deepest
+// first (longest path) so a nested kind directory is attempted before its
+// parent. os.Remove failing on a non-empty directory is the expected outcome
+// for a directory that still holds content, not an error worth surfacing.
+func pruneEmptyDirs(dirs []string) {
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+
+	for _, dir := range dirs {
+		_ = os.Remove(dir)
+	}
 }
