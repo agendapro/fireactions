@@ -5,6 +5,7 @@ package cache
 
 import (
 	"fmt"
+	"net"
 
 	units "github.com/docker/go-units"
 )
@@ -51,10 +52,27 @@ func (c *Config) MaxSizeBytes() (int64, error) {
 	return b, nil
 }
 
-// Validate validates the configuration.
+// Validate validates the configuration. It is deliberately self-contained —
+// it enforces every invariant the struct tags describe, not just the ones
+// the parent server.Config validator happens to dive into — so a caller
+// constructing a Config directly cannot reach Manager.Start with an empty
+// bind_address (which net.Listen would happily turn into an all-interfaces,
+// dual-stack listener on a random port).
 func (c *Config) Validate() error {
 	if !c.Enabled {
 		return nil
+	}
+
+	if c.BindAddress == "" {
+		return fmt.Errorf("cache: bind_address is required when enabled")
+	}
+
+	if _, _, err := net.SplitHostPort(c.BindAddress); err != nil {
+		return fmt.Errorf("cache: invalid bind_address %q: %w", c.BindAddress, err)
+	}
+
+	if c.MaxSize == "" {
+		return fmt.Errorf("cache: max_size is required when enabled")
 	}
 
 	size, err := c.MaxSizeBytes()

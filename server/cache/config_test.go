@@ -91,6 +91,63 @@ func TestConfig_Validate(t *testing.T) {
 	}
 }
 
+// TestConfig_Validate_Standalone pins Validate as self-contained: every
+// invariant must hold without the parent server.Config validator's struct
+// dive. An enabled config with an empty or malformed bind_address must be
+// rejected by Validate alone — otherwise a caller constructing a Config
+// directly reaches net.Listen("tcp", ""), which binds all interfaces
+// dual-stack on a random port.
+func TestConfig_Validate_Standalone(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      Config
+		expectError bool
+	}{
+		{
+			name:   "disabled config is always valid",
+			config: Config{Enabled: false},
+		},
+		{
+			name:        "enabled with empty bind_address",
+			config:      Config{Enabled: true, MaxSize: "50GB"},
+			expectError: true,
+		},
+		{
+			name:        "enabled with bind_address missing port",
+			config:      Config{Enabled: true, BindAddress: "192.168.128.1", MaxSize: "50GB"},
+			expectError: true,
+		},
+		{
+			name:        "enabled with empty max_size",
+			config:      Config{Enabled: true, BindAddress: "192.168.128.1:5050"},
+			expectError: true,
+		},
+		{
+			name:        "enabled with zero max_size",
+			config:      Config{Enabled: true, BindAddress: "192.168.128.1:5050", MaxSize: "0"},
+			expectError: true,
+		},
+		{
+			name:   "enabled fully specified",
+			config: Config{Enabled: true, BindAddress: "192.168.128.1:5050", MaxSize: "50GB"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.config
+
+			err := cfg.Validate()
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestConfig_MaxSizeBytes(t *testing.T) {
 	tests := []struct {
 		name    string
