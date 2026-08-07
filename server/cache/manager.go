@@ -109,14 +109,20 @@ func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 }
 
 // Start performs the fallible setup required before the cache can serve
-// traffic. max_size is parsed first — config is already validated at load
-// time, so this is a belt-and-braces check that also caches the parsed
-// value off the hot path, before any I/O happens. The disk store is created
+// traffic. The config is re-validated first — it is already validated at
+// load time, so this is a belt-and-braces check for callers that construct
+// a Config directly, covering every invariant (bind_address shape, max_size
+// positivity) rather than a partial subset — and max_size is parsed and
+// cached off the hot path before any I/O happens. The disk store is created
 // next — it is the cheapest and least destructive I/O failure to check, so
 // a bad data_dir never causes netfilter mutations on the host. The firewall
 // guard is installed after that and gates everything following it: if it
 // cannot be installed, the cache never binds its listener (D-07).
 func (m *Manager) Start(_ context.Context) error {
+	if err := m.config.Validate(); err != nil {
+		return fmt.Errorf("cache: invalid config: %w", err)
+	}
+
 	maxSizeBytes, err := m.config.MaxSizeBytes()
 	if err != nil {
 		return fmt.Errorf("cache: parsing max_size: %w", err)

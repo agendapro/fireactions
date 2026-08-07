@@ -493,6 +493,41 @@ func TestManager_Start_InvalidMaxSize(t *testing.T) {
 	assert.Nil(t, m.Addr())
 }
 
+// TestManager_Start_ZeroMaxSizeFailsClosed is the WR-01 regression check,
+// portable on any host: a directly constructed Config with max_size "0"
+// bypasses config-load validation, and Start's belt-and-braces re-validation
+// must reject it — otherwise every sweep would run with maxBytes=0 and
+// silently evict the entire cache while the listener keeps serving 404s.
+func TestManager_Start_ZeroMaxSizeFailsClosed(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxSize = "0"
+
+	m, err := New(cfg, []string{"8080"})
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_size must be greater than zero")
+	assert.Nil(t, m.Addr())
+}
+
+// TestManager_Start_EmptyBindAddressFailsClosed is the WR-02 half of the
+// same belt-and-braces check, portable on any host: an enabled Config with
+// an empty bind_address must never reach net.Listen("tcp", ""), which would
+// bind all interfaces dual-stack on a random port.
+func TestManager_Start_EmptyBindAddressFailsClosed(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.BindAddress = ""
+
+	m, err := New(cfg, []string{"8080"})
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bind_address")
+	assert.Nil(t, m.Addr())
+}
+
 // TestManager_Start_ParsesMaxSizeBytesBeforeGuardStep is portable on any
 // host: max_size parsing happens before the firewall guard step, so
 // maxSizeBytes is set regardless of whether the guard install that follows
