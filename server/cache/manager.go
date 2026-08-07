@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -25,6 +26,8 @@ type Manager struct {
 	mux            *http.ServeMux
 	store          *Store
 	guardInstalled bool
+	sweepInterval  time.Duration
+	maxSizeBytes   int64
 }
 
 // Opt is a functional option for Manager.
@@ -34,6 +37,23 @@ type Opt func(m *Manager)
 func WithLogger(logger *zerolog.Logger) Opt {
 	f := func(m *Manager) {
 		m.logger = logger
+	}
+
+	return f
+}
+
+// defaultSweepInterval is how often the background sweep runs when
+// WithSweepInterval is not supplied. It is intentionally not exposed in the
+// YAML schema: D-09 accepts temporary overshoot between sweeps, and adding a
+// config field would widen the operator surface for no demonstrated need.
+const defaultSweepInterval = 5 * time.Minute
+
+// WithSweepInterval overrides the default sweep interval
+// (defaultSweepInterval). Tests use this to drive the sweep loop on a short
+// interval instead of waiting for the real 5-minute default.
+func WithSweepInterval(d time.Duration) Opt {
+	f := func(m *Manager) {
+		m.sweepInterval = d
 	}
 
 	return f
@@ -66,6 +86,8 @@ func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 		mux:            nil,
 		store:          nil,
 		guardInstalled: false,
+		sweepInterval:  defaultSweepInterval,
+		maxSizeBytes:   0,
 	}
 
 	for _, opt := range opts {
@@ -87,12 +109,21 @@ func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 }
 
 // Start performs the fallible setup required before the cache can serve
-// traffic. The disk store is created first — it is the cheapest and least
-// destructive failure to check, so a bad data_dir never causes netfilter
-// mutations on the host. The firewall guard is installed next and gates
-// everything after it: if it cannot be installed, the cache never binds
-// its listener (D-07).
+// traffic. max_size is parsed first — config is already validated at load
+// time, so this is a belt-and-braces check that also caches the parsed
+// value off the hot path, before any I/O happens. The disk store is created
+// next — it is the cheapest and least destructive I/O failure to check, so
+// a bad data_dir never causes netfilter mutations on the host. The firewall
+// guard is installed after that and gates everything following it: if it
+// cannot be installed, the cache never binds its listener (D-07).
 func (m *Manager) Start(_ context.Context) error {
+	maxSizeBytes, err := m.config.MaxSizeBytes()
+	if err != nil {
+		return fmt.Errorf("cache: parsing max_size: %w", err)
+	}
+
+	m.maxSizeBytes = maxSizeBytes
+
 	store, err := NewStore(m.logger, m.config.DataDir)
 	if err != nil {
 		return fmt.Errorf("cache: creating store: %w", err)
@@ -122,6 +153,8 @@ func (m *Manager) Start(_ context.Context) error {
 	m.listener = listener
 	m.logger.Info().Str("address", listener.Addr().String()).Msg("Cache listening")
 
+	metricCacheUp.Set(1)
+
 	return nil
 }
 
@@ -136,13 +169,31 @@ func (m *Manager) Addr() net.Addr {
 }
 
 // Run serves the cache HTTP listener and blocks until it is shut down. It
-// returns an error if Start has not run yet.
-func (m *Manager) Run(_ context.Context) error {
+// also drives the periodic sweep that keeps disk usage under the operator's
+// max_size cap: one sweep runs immediately, then one on every tick of
+// sweepInterval, until the listener is drained. Run does not return until
+// the sweep goroutine has stopped, so a caller can rely on Run returning as
+// the signal that nothing is still touching data_dir. It returns an error
+// if Start has not run yet.
+func (m *Manager) Run(ctx context.Context) error {
 	if m.listener == nil {
 		return fmt.Errorf("cache: Run called before Start")
 	}
 
+	sweepCtx, cancelSweep := context.WithCancel(ctx)
+	defer cancelSweep()
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go m.runSweep(sweepCtx, &wg)
+
 	err := m.httpServer.Serve(m.listener)
+
+	cancelSweep()
+	wg.Wait()
+
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("cache: serve: %w", err)
 	}
@@ -161,6 +212,8 @@ func (m *Manager) Shutdown(ctx context.Context) {
 			m.logger.Warn().Err(err).Msg("Failed to gracefully shut down cache")
 		}
 	}
+
+	metricCacheUp.Set(0)
 
 	if !m.guardInstalled {
 		return
@@ -223,4 +276,58 @@ func (m *Manager) handleCacheGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, "", fi.ModTime(), f)
+}
+
+// runSweep runs one sweep immediately, then one on every tick of
+// sweepInterval, until ctx is cancelled. A sweep error is logged and the
+// loop continues — a failing sweep must never take down the listener it
+// shares Run with.
+func (m *Manager) runSweep(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(m.sweepInterval)
+	defer ticker.Stop()
+
+	m.sweepOnce()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.sweepOnce()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// sweepOnce runs a single Store.Sweep pass and publishes its result to the
+// cache_disk_bytes_used gauge and cache_evictions_total counter.
+func (m *Manager) sweepOnce() {
+	result, err := m.store.Sweep(m.maxSizeBytes)
+	if err != nil {
+		m.logger.Error().Err(err).Msg("cache: sweep failed")
+
+		return
+	}
+
+	metricCacheDiskBytesUsed.Set(float64(result.BytesAfter))
+	metricCacheEvictionsTotal.Add(float64(result.Evicted))
+
+	if result.Evicted > 0 {
+		m.logger.Info().
+			Int64("bytes_before", result.BytesBefore).
+			Int64("bytes_after", result.BytesAfter).
+			Int("evicted", result.Evicted).
+			Int("temp_reaped", result.TempReaped).
+			Msg("cache: sweep complete")
+
+		return
+	}
+
+	m.logger.Debug().
+		Int64("bytes_before", result.BytesBefore).
+		Int64("bytes_after", result.BytesAfter).
+		Int("evicted", result.Evicted).
+		Int("temp_reaped", result.TempReaped).
+		Msg("cache: sweep complete")
 }

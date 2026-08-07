@@ -265,12 +265,12 @@ type sweepFile struct {
 // subdirectory as a single pool (D-08 — no per-kind quotas), and evicts
 // least-recently-used content down to sweepLowWaterPercent of maxBytes when
 // usage exceeds it. It also reaps orphaned ".tmp-*" scratch files older than
-// tempFileMaxAge and prunes any kind directory left empty by eviction —
-// dataDir itself is never removed. A single failed deletion is logged at
-// Warn and skipped rather than aborting the pass, so one unlink error can't
-// leave the cache permanently over cap.
+// tempFileMaxAge and prunes any directory this pass's own deletions left
+// empty — dataDir itself is never removed. A single failed deletion is
+// logged at Warn and skipped rather than aborting the pass, so one unlink
+// error can't leave the cache permanently over cap.
 func (s *Store) Sweep(maxBytes int64) (SweepResult, error) {
-	files, dirs, tempReaped, err := s.sweepCollect()
+	files, touchedDirs, tempReaped, err := s.sweepCollect()
 	if err != nil {
 		return SweepResult{}, err
 	}
@@ -284,27 +284,37 @@ func (s *Store) Sweep(maxBytes int64) (SweepResult, error) {
 
 	if bytesBefore > maxBytes {
 		target := maxBytes * sweepLowWaterPercent / 100
-		result.BytesAfter, result.Evicted = s.evictLRU(files, bytesBefore, target)
+
+		var evictedDirs map[string]struct{}
+
+		result.BytesAfter, result.Evicted, evictedDirs = s.evictLRU(files, bytesBefore, target)
+
+		for dir := range evictedDirs {
+			touchedDirs[dir] = struct{}{}
+		}
 	}
 
-	pruneEmptyDirs(dirs)
+	s.pruneEmptyDirs(touchedDirs)
 
 	return result, nil
 }
 
 // sweepCollect walks dataDir once, returning every regular cache-content
-// file plus every directory found (dataDir itself excluded from dirs), and
-// reaping any ".tmp-*" scratch file older than tempFileMaxAge along the way.
+// file, and reaping any ".tmp-*" scratch file older than tempFileMaxAge
+// along the way. touchedDirs collects the parent directory of every file
+// this pass itself reaped — the only directories pruneEmptyDirs is ever
+// allowed to consider (see its own doc comment for why this matters).
 // Non-regular entries (symlinks, devices, ...) are skipped entirely: d.Type()
 // reflects the raw directory-entry type from the walk itself, not a followed
 // stat, so this check alone keeps a symlink escape out of consideration for
 // accounting or deletion.
-func (s *Store) sweepCollect() ([]sweepFile, []string, int, error) {
+func (s *Store) sweepCollect() ([]sweepFile, map[string]struct{}, int, error) {
 	var (
 		files      []sweepFile
-		dirs       []string
 		tempReaped int
 	)
+
+	touchedDirs := make(map[string]struct{})
 
 	walkErr := filepath.WalkDir(s.dataDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -312,10 +322,6 @@ func (s *Store) sweepCollect() ([]sweepFile, []string, int, error) {
 		}
 
 		if d.IsDir() {
-			if p != s.dataDir {
-				dirs = append(dirs, p)
-			}
-
 			return nil
 		}
 
@@ -331,6 +337,7 @@ func (s *Store) sweepCollect() ([]sweepFile, []string, int, error) {
 		if strings.HasPrefix(filepath.Base(p), tempFilePrefix) {
 			if s.reapTempFileIfStale(p, info) {
 				tempReaped++
+				touchedDirs[filepath.Dir(p)] = struct{}{}
 			}
 
 			return nil
@@ -344,7 +351,7 @@ func (s *Store) sweepCollect() ([]sweepFile, []string, int, error) {
 		return nil, nil, 0, fmt.Errorf("cache: store: sweep: %w", walkErr)
 	}
 
-	return files, dirs, tempReaped, nil
+	return files, touchedDirs, tempReaped, nil
 }
 
 // sweepEntryErr classifies an error found while visiting p during the walk:
@@ -385,14 +392,16 @@ func (s *Store) reapTempFileIfStale(p string, info fs.FileInfo) bool {
 }
 
 // evictLRU sorts files by mtime ascending and deletes from the front until
-// the running total is at or below target, returning the bytes remaining
-// and the count evicted. A single failed deletion is logged at Warn and
-// skipped, not returned — one unlink error must not abort the pass.
-func (s *Store) evictLRU(files []sweepFile, bytesBefore, target int64) (int64, int) {
+// the running total is at or below target, returning the bytes remaining,
+// the count evicted, and the set of directories this call itself deleted a
+// file from (see pruneEmptyDirs). A single failed deletion is logged at
+// Warn and skipped, not returned — one unlink error must not abort the pass.
+func (s *Store) evictLRU(files []sweepFile, bytesBefore, target int64) (int64, int, map[string]struct{}) {
 	sort.Slice(files, func(i, j int) bool { return files[i].modTime.Before(files[j].modTime) })
 
 	running := bytesBefore
 	evicted := 0
+	touchedDirs := make(map[string]struct{})
 
 	for _, f := range files {
 		if running <= target {
@@ -409,21 +418,58 @@ func (s *Store) evictLRU(files []sweepFile, bytesBefore, target int64) (int64, i
 
 		running -= f.size
 		evicted++
+		touchedDirs[filepath.Dir(f.path)] = struct{}{}
 
 		s.logger.Debug().Str("path", f.path).Int64("size", f.size).Msg("cache: store: sweep: evicted")
 	}
 
-	return running, evicted
+	return running, evicted, touchedDirs
 }
 
-// pruneEmptyDirs removes any directory in dirs that is now empty, deepest
-// first (longest path) so a nested kind directory is attempted before its
-// parent. os.Remove failing on a non-empty directory is the expected outcome
-// for a directory that still holds content, not an error worth surfacing.
-func pruneEmptyDirs(dirs []string) {
-	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+// pruneEmptyDirs removes any directory this sweep pass itself deleted a
+// file from and left empty, then walks upward toward dataDir so a fully
+// emptied nested chain collapses in one pass — dataDir itself is never
+// removed.
+//
+// startDirs must only ever contain directories this exact Sweep call
+// deleted a file from (evicted or reaped), never a directory merely
+// observed during the walk: a kind directory a concurrent Put has just
+// created via MkdirAll — but not yet written its file into — is otherwise
+// indistinguishable from a genuinely empty one at that instant, and would
+// be removed out from under the in-flight write. Restricting candidates to
+// directories this pass provably emptied itself closes that race: nothing
+// is ever removed unless this pass is the one that made it empty.
+//
+// os.Remove failing on a non-empty directory (real content still present,
+// or a concurrent write landed in it after the removal that made it a
+// candidate) is the expected outcome, not an error worth surfacing — it
+// also correctly stops the upward walk at that point.
+func (s *Store) pruneEmptyDirs(startDirs map[string]struct{}) {
+	queue := make([]string, 0, len(startDirs))
+	for dir := range startDirs {
+		queue = append(queue, dir)
+	}
 
-	for _, dir := range dirs {
-		_ = os.Remove(dir)
+	seen := make(map[string]struct{}, len(startDirs))
+
+	for len(queue) > 0 {
+		dir := queue[0]
+		queue = queue[1:]
+
+		if dir == s.dataDir {
+			continue
+		}
+
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+
+		seen[dir] = struct{}{}
+
+		if err := os.Remove(dir); err != nil {
+			continue
+		}
+
+		queue = append(queue, filepath.Dir(dir))
 	}
 }

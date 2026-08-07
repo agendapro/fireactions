@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -457,4 +459,336 @@ func TestManager_RestartPersistence(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	assert.Equal(t, "v1 content", string(body))
+}
+
+func TestNew_DefaultSweepInterval(t *testing.T) {
+	cfg := testConfig(t)
+
+	m, err := New(cfg, []string{"8080"})
+	require.NoError(t, err)
+	assert.Equal(t, defaultSweepInterval, m.sweepInterval)
+}
+
+func TestNew_WithSweepIntervalOption(t *testing.T) {
+	cfg := testConfig(t)
+
+	m, err := New(cfg, []string{"8080"}, WithSweepInterval(50*time.Millisecond))
+	require.NoError(t, err)
+	assert.Equal(t, 50*time.Millisecond, m.sweepInterval)
+}
+
+// TestManager_Start_InvalidMaxSize is portable: max_size is parsed before
+// any I/O (store creation, firewall install, listen), so a garbage value
+// fails fast with a wrapped error and never touches the filesystem.
+func TestManager_Start_InvalidMaxSize(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxSize = "not-a-size"
+
+	m, err := New(cfg, []string{"8080"})
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing max_size")
+	assert.Nil(t, m.Addr())
+}
+
+// TestManager_Start_ParsesMaxSizeBytesBeforeGuardStep is portable on any
+// host: max_size parsing happens before the firewall guard step, so
+// maxSizeBytes is set regardless of whether the guard install that follows
+// it succeeds (root+Linux) or fails closed (everywhere else). The chain
+// name is overridden and the manager shut down unconditionally so a
+// root+Linux run — where Start actually succeeds end to end — never leaves
+// the production guard chain installed on the host running the test.
+func TestManager_Start_ParsesMaxSizeBytesBeforeGuardStep(t *testing.T) {
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+	cfg.MaxSize = "2GB"
+
+	m, err := New(cfg, []string{"8080"})
+	require.NoError(t, err)
+
+	_ = m.Start(context.Background())
+	defer m.Shutdown(context.Background())
+
+	assert.Equal(t, int64(2*1024*1024*1024), m.maxSizeBytes)
+}
+
+// TestManager_Run_SweepDrivesUsageUnderCap exercises the sweep really
+// running from Run (not only when Store.Sweep is called directly): content
+// seeded over the cap is driven back down to the low-water mark within a
+// bounded wait. Requires root+Linux for a real Start.
+func TestManager_Run_SweepDrivesUsageUnderCap(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+	cfg.MaxSize = "5000" // low-water target: 4500 bytes
+
+	m, err := New(cfg, []string{"8080"}, WithSweepInterval(50*time.Millisecond))
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.NoError(t, err)
+
+	for i := range 10 {
+		require.NoError(t, m.store.Put("gomod", fmt.Sprintf("file-%02d", i), strings.NewReader(strings.Repeat("a", 1000))))
+	}
+
+	runErrCh := make(chan error, 1)
+
+	go func() {
+		runErrCh <- m.Run(context.Background())
+	}()
+
+	assert.Eventually(t, func() bool {
+		usage, usageErr := m.store.Usage()
+
+		return usageErr == nil && usage <= 4500
+	}, 3*time.Second, 20*time.Millisecond)
+
+	m.Shutdown(context.Background())
+
+	select {
+	case runErr := <-runErrCh:
+		assert.NoError(t, runErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for Run to return after Shutdown")
+	}
+}
+
+// TestManager_Run_ImmediateSweepBeforeFirstTick uses a deliberately long
+// sweep interval: if the sweep only ran on ticks, usage would never drop
+// within this test's bounded wait, so a passing test proves the immediate
+// pre-loop sweep runs. Requires root+Linux for a real Start.
+func TestManager_Run_ImmediateSweepBeforeFirstTick(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+	cfg.MaxSize = "5000"
+
+	m, err := New(cfg, []string{"8080"}, WithSweepInterval(time.Hour))
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.NoError(t, err)
+
+	defer m.Shutdown(context.Background())
+
+	for i := range 10 {
+		require.NoError(t, m.store.Put("gomod", fmt.Sprintf("file-%02d", i), strings.NewReader(strings.Repeat("a", 1000))))
+	}
+
+	go func() { _ = m.Run(context.Background()) }()
+
+	assert.Eventually(t, func() bool {
+		usage, usageErr := m.store.Usage()
+
+		return usageErr == nil && usage <= 4500
+	}, 3*time.Second, 20*time.Millisecond)
+}
+
+// TestManager_Run_SweepGoroutineStopsBeforeReturn is the goroutine-quiescent
+// shutdown guarantee: after Run returns, nothing is still touching
+// data_dir. Proven by writing a file over the (tiny) cap after Run returns
+// and confirming it is never evicted. Requires root+Linux for a real Start.
+func TestManager_Run_SweepGoroutineStopsBeforeReturn(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+	cfg.MaxSize = "1000" // tiny cap: any lingering sweep would evict a fresh write
+
+	m, err := New(cfg, []string{"8080"}, WithSweepInterval(10*time.Millisecond))
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.NoError(t, err)
+
+	runErrCh := make(chan error, 1)
+
+	go func() {
+		runErrCh <- m.Run(context.Background())
+	}()
+
+	// Let at least one sweep tick happen before shutting down.
+	time.Sleep(50 * time.Millisecond)
+
+	m.Shutdown(context.Background())
+
+	select {
+	case runErr := <-runErrCh:
+		assert.NoError(t, runErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for Run to return after Shutdown")
+	}
+
+	require.NoError(t, m.store.Put("gomod", "post-shutdown", strings.NewReader(strings.Repeat("a", 2000))))
+
+	time.Sleep(100 * time.Millisecond)
+
+	full, err := m.store.Path("gomod", "post-shutdown")
+	require.NoError(t, err)
+
+	_, statErr := os.Stat(full)
+	assert.NoError(t, statErr,
+		"expected file written after Run returned to survive — sweep goroutine must be fully stopped")
+}
+
+// TestManager_Run_SweepErrorDoesNotStopServing removes data_dir out from
+// under a running store so every sweep attempt errors: Run must log and
+// continue, never take the listener down. Requires root+Linux for a real
+// Start.
+func TestManager_Run_SweepErrorDoesNotStopServing(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+
+	m, err := New(cfg, []string{"8080"}, WithSweepInterval(20*time.Millisecond))
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.NoError(t, err)
+
+	require.NoError(t, os.RemoveAll(cfg.DataDir))
+
+	runErrCh := make(chan error, 1)
+
+	go func() {
+		runErrCh <- m.Run(context.Background())
+	}()
+
+	addr := "http://" + m.Addr().String()
+
+	assert.Eventually(t, func() bool {
+		resp, getErr := http.Get(addr + "/healthz")
+		if getErr != nil {
+			return false
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		return resp.StatusCode == http.StatusOK
+	}, 500*time.Millisecond, 10*time.Millisecond)
+
+	// Give the failing sweep several ticks to prove it doesn't take down Run.
+	time.Sleep(150 * time.Millisecond)
+
+	resp, err := http.Get(addr + "/healthz")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	m.Shutdown(context.Background())
+
+	select {
+	case runErr := <-runErrCh:
+		assert.NoError(t, runErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for Run to return after Shutdown")
+	}
+}
+
+// TestManager_Metrics_CacheUp is 1 while running and 0 after Shutdown.
+// Requires root+Linux for a real Start.
+func TestManager_Metrics_CacheUp(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+
+	m, err := New(cfg, []string{"8080"})
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.NoError(t, err)
+
+	assert.InDelta(t, float64(1), testutil.ToFloat64(metricCacheUp), 0)
+
+	m.Shutdown(context.Background())
+
+	assert.InDelta(t, float64(0), testutil.ToFloat64(metricCacheUp), 0)
+}
+
+// TestManager_Metrics_DiskBytesUsedReflectsPostSweepUsage. Requires
+// root+Linux for a real Start.
+func TestManager_Metrics_DiskBytesUsedReflectsPostSweepUsage(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+	cfg.MaxSize = "1GB" // large cap: nothing evicted, disk_bytes_used reflects the raw write
+
+	m, err := New(cfg, []string{"8080"}, WithSweepInterval(30*time.Millisecond))
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.NoError(t, err)
+
+	defer m.Shutdown(context.Background())
+
+	require.NoError(t, m.store.Put("gomod", "a", strings.NewReader(strings.Repeat("a", 1234))))
+
+	go func() { _ = m.Run(context.Background()) }()
+
+	assert.Eventually(t, func() bool {
+		return testutil.ToFloat64(metricCacheDiskBytesUsed) == 1234
+	}, 3*time.Second, 20*time.Millisecond)
+}
+
+// TestManager_Metrics_EvictionsTotalIncreasesBySweepEvictions asserts a
+// delta, not an absolute value: the counter is a package-level collector
+// shared across sibling tests. Requires root+Linux for a real Start.
+func TestManager_Metrics_EvictionsTotalIncreasesBySweepEvictions(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
+	cfg := testConfig(t)
+	cfg.MaxSize = "2000" // low-water target: 1800 bytes
+
+	m, err := New(cfg, []string{"8080"}, WithSweepInterval(30*time.Millisecond))
+	require.NoError(t, err)
+
+	err = m.Start(context.Background())
+	require.NoError(t, err)
+
+	defer m.Shutdown(context.Background())
+
+	before := testutil.ToFloat64(metricCacheEvictionsTotal)
+
+	for i := range 5 {
+		require.NoError(t, m.store.Put("gomod", fmt.Sprintf("f-%d", i), strings.NewReader(strings.Repeat("a", 1000))))
+	}
+
+	go func() { _ = m.Run(context.Background()) }()
+
+	assert.Eventually(t, func() bool {
+		return testutil.ToFloat64(metricCacheEvictionsTotal) > before
+	}, 3*time.Second, 20*time.Millisecond)
 }
