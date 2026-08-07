@@ -24,10 +24,11 @@ Expected: only the gRPC and metrics ports are listed. No cache port.
 
 ```bash
 iptables -L FIREACTIONS-CACHE-GUARD -n
+ip6tables -L FIREACTIONS-CACHE-GUARD -n
 ```
 
-Expected: `iptables: No chain/target/match by that name.` — the guard chain does not exist at all
-when the cache is disabled.
+Expected: `iptables: No chain/target/match by that name.` from both — the guard chain does not
+exist in either netfilter family when the cache is disabled.
 
 ## 2. Reachable from a VM, control plane is not
 
@@ -56,6 +57,26 @@ curl -sS --connect-timeout 2 http://192.168.128.1:8081/
 Expected: both time out or are refused — the unauthenticated gRPC and metrics ports are not
 reachable from the guest.
 
+The same must hold over IPv6: the gRPC and metrics listeners are dual-stack under the default
+config (a host-less `bind_address` like `:8080` binds `[::]`), and Linux auto-assigns an IPv6
+link-local address to the bridge, so the guard is installed into `ip6tables` as well and must be
+verified there too. From inside the VM, discover the host bridge's link-local address:
+
+```bash
+ping6 -c 2 ff02::1%eth0
+```
+
+Every responder other than the VM's own address is the host side of the bridge. Then, using that
+address:
+
+```bash
+curl -sS -g --connect-timeout 2 "http://[<host-link-local>%eth0]:8080/"
+curl -sS -g --connect-timeout 2 "http://[<host-link-local>%eth0]:8081/"
+```
+
+Expected: both time out or are refused, exactly like the IPv4 checks above. A connection or an
+HTTP response here means the IPv6 half of the guard is missing and must be reported as a bug.
+
 **The in-VM `curl` above is the authoritative check, not `iptables -L` output alone.** A rule
 that exists but was installed into the wrong chain (e.g. `FORWARD` instead of `INPUT`) looks
 correct on inspection but silently does nothing — only a real connection attempt from inside the
@@ -65,15 +86,17 @@ Host-side confirmations, useful for diagnosing a failure in the check above:
 
 ```bash
 iptables -L FIREACTIONS-CACHE-GUARD -n -v
+ip6tables -L FIREACTIONS-CACHE-GUARD -n -v
 ```
 
-Expected: two DROP rules, both scoped `-i fireactions-br0`, one per guarded port.
+Expected: two DROP rules in each family, all scoped `-i fireactions-br0`, one per guarded port.
 
 ```bash
 iptables -L INPUT -n --line-numbers | head -5
+ip6tables -L INPUT -n --line-numbers | head -5
 ```
 
-Expected: the jump to `FIREACTIONS-CACHE-GUARD` is at position 1.
+Expected: the jump to `FIREACTIONS-CACHE-GUARD` is at position 1 in both.
 
 ## 3. Contents survive a restart
 
@@ -152,20 +175,23 @@ shared upstream credential field will be highest.
 
 **After a non-graceful termination** (`kill -9`, an OOM kill, or a supervisor force-stopping the
 process) the guard chain outlives the process — `SIGKILL` bypasses the graceful shutdown path
-entirely, so the chain and its jump rule are never removed. Check with:
+entirely, so the chain and its jump rule are never removed. Check both families with:
 
 ```bash
 iptables -L FIREACTIONS-CACHE-GUARD -n
+ip6tables -L FIREACTIONS-CACHE-GUARD -n
 ```
 
 A subsequent clean start with the cache enabled reuses the existing chain idempotently rather
 than duplicating rules. If the cache is being disabled permanently instead, remove the stale
-chain manually:
+chain manually from both families:
 
 ```bash
-iptables -D INPUT -j FIREACTIONS-CACHE-GUARD
-iptables -F FIREACTIONS-CACHE-GUARD
-iptables -X FIREACTIONS-CACHE-GUARD
+for ipt in iptables ip6tables; do
+  $ipt -D INPUT -j FIREACTIONS-CACHE-GUARD
+  $ipt -F FIREACTIONS-CACHE-GUARD
+  $ipt -X FIREACTIONS-CACHE-GUARD
+done
 ```
 
 **If the CNI bridge is not named `fireactions-br0`** on this host, the guard rules still install

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
@@ -20,20 +21,42 @@ var guardChainName = "FIREACTIONS-CACHE-GUARD"
 // plan 01-04, not by any runtime check here.
 const bridgeInterface = "fireactions-br0"
 
-// installGuardRules installs a dedicated FIREACTIONS-CACHE-GUARD chain in
-// the filter table's INPUT chain, dropping guest->host traffic from iface to
-// each port in ports. It is idempotent: calling it again (e.g. after an
-// unclean shutdown left the chain behind) reuses the existing chain instead
-// of duplicating rules.
-//
-// Any error here is the D-07 fail-closed signal: the caller must not bind
-// its listener when this returns non-nil.
-func installGuardRules(logger *zerolog.Logger, iface string, ports []string) error {
-	ipt, err := iptables.New() // fails closed: exec.LookPath("iptables") error surfaces here
-	if err != nil {
-		return fmt.Errorf("firewall: iptables unavailable: %w", err)
+// guardProtocols returns both netfilter families the guard must cover. The
+// listeners it protects are dual-stack under the default config (a host-less
+// bind address like ":8080" binds [::], serving IPv4 and IPv6), and Linux
+// auto-assigns an IPv6 link-local address to bridge interfaces — an
+// IPv4-only guard would leave the control-plane ports reachable from guests
+// over IPv6 link-local, bypassing D-07 entirely.
+func guardProtocols() []iptables.Protocol {
+	return []iptables.Protocol{iptables.ProtocolIPv4, iptables.ProtocolIPv6}
+}
+
+// iptablesWaitSeconds bounds how long iptables/ip6tables waits for the
+// xtables lock (--wait) instead of failing immediately when another process
+// on a shared host happens to hold it.
+const iptablesWaitSeconds = 5
+
+// protocolName renders a go-iptables Protocol for error messages.
+func protocolName(proto iptables.Protocol) string {
+	if proto == iptables.ProtocolIPv6 {
+		return "IPv6"
 	}
 
+	return "IPv4"
+}
+
+// installGuardRules installs a dedicated FIREACTIONS-CACHE-GUARD chain in
+// the filter table's INPUT chain — in both the IPv4 and IPv6 netfilter
+// families — dropping guest->host traffic from iface to each port in ports.
+// It is idempotent: calling it again (e.g. after an unclean shutdown left
+// the chain behind) reuses the existing chain instead of duplicating rules.
+//
+// Any error here is the D-07 fail-closed signal: the caller must not bind
+// its listener when this returns non-nil. A host without ip6tables fails
+// closed too — a guard covering only one family is exactly the bypass this
+// function exists to prevent — and a partial install (one family succeeded,
+// the other failed) is rolled back so no netfilter state is left behind.
+func installGuardRules(logger *zerolog.Logger, iface string, ports []string) error {
 	if _, err := net.InterfaceByName(iface); err != nil {
 		// The CNI bridge is created lazily on first VM boot (the same racing
 		// behavior that motivated D-02). iptables accepts rules referencing
@@ -43,43 +66,85 @@ func installGuardRules(logger *zerolog.Logger, iface string, ports []string) err
 		logger.Warn().Str("interface", iface).Err(err).Msg("CNI bridge not present yet, guard rules installed ahead of it")
 	}
 
+	for _, proto := range guardProtocols() {
+		if err := installGuardRulesFamily(proto, iface, ports); err != nil {
+			if removeErr := removeGuardRules(); removeErr != nil {
+				logger.Warn().Err(removeErr).Msg("Failed to roll back partially installed guard rules")
+			}
+
+			return err
+		}
+	}
+
+	return nil
+}
+
+// installGuardRulesFamily installs the guard chain, its DROP rules, and the
+// INPUT jump for a single netfilter family.
+func installGuardRulesFamily(proto iptables.Protocol, iface string, ports []string) error {
+	ipt, err := iptables.New(iptables.IPFamily(proto), iptables.Timeout(iptablesWaitSeconds))
+	if err != nil {
+		// fails closed: exec.LookPath("iptables"/"ip6tables") error surfaces here
+		return fmt.Errorf("firewall: iptables unavailable (%s): %w", protocolName(proto), err)
+	}
+
 	exists, err := ipt.ChainExists("filter", guardChainName)
 	if err != nil {
-		return fmt.Errorf("firewall: checking chain: %w", err)
+		return fmt.Errorf("firewall: checking chain (%s): %w", protocolName(proto), err)
 	}
 
 	if !exists {
 		if err := ipt.NewChain("filter", guardChainName); err != nil {
-			return fmt.Errorf("firewall: creating chain: %w", err)
+			return fmt.Errorf("firewall: creating chain (%s): %w", protocolName(proto), err)
 		}
 	}
 
 	for _, port := range ports {
 		rule := []string{"-i", iface, "-p", "tcp", "--dport", port, "-j", "DROP"}
 		if err := ipt.AppendUnique("filter", guardChainName, rule...); err != nil {
-			return fmt.Errorf("firewall: adding drop rule for port %s: %w", port, err)
+			return fmt.Errorf("firewall: adding drop rule for port %s (%s): %w", port, protocolName(proto), err)
 		}
 	}
 
 	jumpRule := []string{"-j", guardChainName}
 	if err := ipt.InsertUnique("filter", "INPUT", 1, jumpRule...); err != nil {
-		return fmt.Errorf("firewall: installing jump rule: %w", err)
+		return fmt.Errorf("firewall: installing jump rule (%s): %w", protocolName(proto), err)
 	}
 
 	return nil
 }
 
 // removeGuardRules removes the jump rule from INPUT and deletes the guard
-// chain. It is idempotent: calling it when nothing is installed returns nil.
-// Deleting by chain name — rather than reconstructed rulespecs — is what
-// makes cleanup survive a config change between start and stop.
+// chain in both netfilter families. It is idempotent: calling it when
+// nothing is installed returns nil. Deleting by chain name — rather than
+// reconstructed rulespecs — is what makes cleanup survive a config change
+// between start and stop. Both families are always attempted: a failure in
+// one must not leave the other's chain behind.
 func removeGuardRules() error {
-	ipt, err := iptables.New()
+	var errs []error
+
+	for _, proto := range guardProtocols() {
+		if err := removeGuardRulesFamily(proto); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// removeGuardRulesFamily removes the guard chain and its INPUT jump for a
+// single netfilter family.
+func removeGuardRulesFamily(proto iptables.Protocol) error {
+	ipt, err := iptables.New(iptables.IPFamily(proto), iptables.Timeout(iptablesWaitSeconds))
 	if err != nil {
-		return fmt.Errorf("firewall: iptables unavailable: %w", err)
+		return fmt.Errorf("firewall: iptables unavailable (%s): %w", protocolName(proto), err)
 	}
 
 	_ = ipt.DeleteIfExists("filter", "INPUT", "-j", guardChainName)
 
-	return ipt.ClearAndDeleteChain("filter", guardChainName)
+	if err := ipt.ClearAndDeleteChain("filter", guardChainName); err != nil {
+		return fmt.Errorf("firewall: removing chain (%s): %w", protocolName(proto), err)
+	}
+
+	return nil
 }
