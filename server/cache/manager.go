@@ -12,15 +12,18 @@ import (
 )
 
 // Manager manages the lifecycle of the cache component: the single
-// path-routed HTTP listener that serves all cache kinds. Later phases add
-// firewall scoping and a bounded disk store on top of this same Manager.
+// path-routed HTTP listener that serves all cache kinds, guarded by a
+// dedicated firewall chain that blocks guest access to fireactions' own
+// ports. A later phase adds a bounded disk store on top of this same
+// Manager.
 type Manager struct {
-	config       *Config
-	guardedPorts []string
-	logger       *zerolog.Logger
-	httpServer   *http.Server
-	listener     net.Listener
-	mux          *http.ServeMux
+	config         *Config
+	guardedPorts   []string
+	logger         *zerolog.Logger
+	httpServer     *http.Server
+	listener       net.Listener
+	mux            *http.ServeMux
+	guardInstalled bool
 }
 
 // Opt is a functional option for Manager.
@@ -35,13 +38,13 @@ func WithLogger(logger *zerolog.Logger) Opt {
 	return f
 }
 
-// New creates a new Manager. It performs no I/O — fallible setup (binding
-// the listener) happens in Start.
+// New creates a new Manager. It performs no I/O — fallible setup (firewall
+// install, binding the listener) happens in Start.
 //
 // guardedPorts must be non-empty: a Manager that guards nothing must be
-// unconstructible. Plan 01-02 uses guardedPorts to install a firewall rule
-// that blocks guest access to fireactions' own gRPC/metrics ports from the
-// CNI bridge before the cache listener starts.
+// unconstructible. Start uses guardedPorts to install a firewall rule that
+// blocks guest access to fireactions' own gRPC/metrics ports from the CNI
+// bridge before the cache listener starts.
 func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 	if config == nil {
 		return nil, fmt.Errorf("cache: config is required")
@@ -54,12 +57,13 @@ func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 	logger := zerolog.Nop()
 
 	m := &Manager{
-		config:       config,
-		guardedPorts: guardedPorts,
-		logger:       &logger,
-		httpServer:   nil,
-		listener:     nil,
-		mux:          nil,
+		config:         config,
+		guardedPorts:   guardedPorts,
+		logger:         &logger,
+		httpServer:     nil,
+		listener:       nil,
+		mux:            nil,
+		guardInstalled: false,
 	}
 
 	for _, opt := range opts {
@@ -81,13 +85,28 @@ func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 }
 
 // Start performs the fallible setup required before the cache can serve
-// traffic. Structured so that additional pre-listen steps (firewall install
-// in 01-02, disk store creation in 01-03) can be inserted above net.Listen
-// without reordering: nothing may bind a guest-reachable port before those
-// steps succeed.
+// traffic. The firewall guard is installed first and gates everything
+// after it: if it cannot be installed, the cache never binds its listener
+// (D-07). Structured so that a later phase's disk store creation can be
+// inserted above the listen call without reordering: nothing may bind a
+// guest-reachable port before that step succeeds either.
 func (m *Manager) Start(_ context.Context) error {
+	if err := installGuardRules(m.logger, bridgeInterface, m.guardedPorts); err != nil {
+		return fmt.Errorf("cache: installing firewall guard: %w", err)
+	}
+
+	m.guardInstalled = true
+
 	listener, err := net.Listen("tcp", m.config.BindAddress)
 	if err != nil {
+		// A start that did not complete must not leave netfilter state
+		// behind on a host fireactions doesn't own exclusively.
+		if removeErr := removeGuardRules(); removeErr != nil {
+			m.logger.Warn().Err(removeErr).Msg("Failed to remove firewall guard after failed listen")
+		}
+
+		m.guardInstalled = false
+
 		return fmt.Errorf("cache: listen on %s: %w", m.config.BindAddress, err)
 	}
 
@@ -122,16 +141,27 @@ func (m *Manager) Run(_ context.Context) error {
 	return nil
 }
 
-// Shutdown gracefully drains the cache HTTP listener. It tolerates being
-// called when Start never ran.
+// Shutdown gracefully drains the cache HTTP listener, then removes the
+// firewall guard if Start installed one. It tolerates being called when
+// Start never ran, or failed before installing the guard. The HTTP server
+// is drained before the guard is removed so no request is in flight while
+// the control-plane ports become reachable again.
 func (m *Manager) Shutdown(ctx context.Context) {
-	if m.httpServer == nil {
+	if m.httpServer != nil {
+		if err := m.httpServer.Shutdown(ctx); err != nil {
+			m.logger.Warn().Err(err).Msg("Failed to gracefully shut down cache")
+		}
+	}
+
+	if !m.guardInstalled {
 		return
 	}
 
-	if err := m.httpServer.Shutdown(ctx); err != nil {
-		m.logger.Warn().Err(err).Msg("Failed to gracefully shut down cache")
+	if err := removeGuardRules(); err != nil {
+		m.logger.Warn().Err(err).Msg("Failed to remove firewall guard")
 	}
+
+	m.guardInstalled = false
 }
 
 func (m *Manager) buildMux() *http.ServeMux {

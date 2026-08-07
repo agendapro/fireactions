@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -18,6 +20,21 @@ func testConfig(t *testing.T) *Config {
 		BindAddress: "127.0.0.1:0",
 		MaxSize:     "1GB",
 		DataDir:     t.TempDir(),
+	}
+}
+
+// requireRootLinux skips the calling test unless it is running as root on
+// Linux — real firewall guard install requires CAP_NET_ADMIN, which is only
+// exercised there (Pitfall 2's two-tier strategy, reused from firewall_test.go).
+func requireRootLinux(t *testing.T) {
+	t.Helper()
+
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping: requires Linux (real iptables/netfilter)")
+	}
+
+	if os.Geteuid() != 0 {
+		t.Skip("skipping: requires root (CAP_NET_ADMIN) to mutate iptables")
 	}
 }
 
@@ -50,7 +67,42 @@ func TestManager_Run_BeforeStart(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestManager_Start_FirewallGuardFailsClosed exercises D-07 on any host
+// where the guard cannot be installed (macOS dev, unprivileged Linux CI):
+// Start must return a non-nil error wrapping the firewall failure, and
+// Addr() must be nil afterwards — the listener is never created. Shutdown
+// after the failed Start must not panic and must not attempt guard removal.
+func TestManager_Start_FirewallGuardFailsClosed(t *testing.T) {
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		t.Skip("skipping fail-closed test: running as root on Linux, guard install is expected to succeed")
+	}
+
+	cfg := testConfig(t)
+
+	m, err := New(cfg, []string{"8080", "8081"})
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+
+	err = m.Start(context.Background())
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "firewall:")
+	assert.Nil(t, m.Addr())
+
+	assert.NotPanics(t, func() { m.Shutdown(context.Background()) })
+	assert.False(t, m.guardInstalled)
+}
+
+// TestManager_Start_AddressInUse exercises the pre-existing listen-failure
+// path, now gated behind guard install succeeding first — requires root and
+// Linux. Verifies the guard is rolled back when net.Listen fails, leaving no
+// host state behind.
 func TestManager_Start_AddressInUse(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
 	cfg := testConfig(t)
 
 	m1, err := New(cfg, []string{"8080"})
@@ -73,9 +125,19 @@ func TestManager_Start_AddressInUse(t *testing.T) {
 	err = m2.Start(context.Background())
 	assert.Error(t, err)
 	assert.Nil(t, m2.Addr())
+	assert.False(t, m2.guardInstalled)
 }
 
+// TestManager_Lifecycle exercises the full happy path end-to-end (guard
+// install, real listener, /healthz, /nope 404, graceful shutdown, guard
+// removal) — requires root and Linux.
 func TestManager_Lifecycle(t *testing.T) {
+	requireRootLinux(t)
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+
 	cfg := testConfig(t)
 
 	m, err := New(cfg, []string{"8080", "8081"})
@@ -85,6 +147,7 @@ func TestManager_Lifecycle(t *testing.T) {
 	err = m.Start(context.Background())
 	assert.NoError(t, err)
 	assert.NotNil(t, m.Addr())
+	assert.True(t, m.guardInstalled)
 
 	runErrCh := make(chan error, 1)
 	go func() {
@@ -119,6 +182,7 @@ func TestManager_Lifecycle(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, resp404.StatusCode)
 
 	m.Shutdown(context.Background())
+	assert.False(t, m.guardInstalled)
 
 	select {
 	case runErr := <-runErrCh:
