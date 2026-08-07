@@ -78,6 +78,61 @@ func TestFirewall_GuardRules_InstallIdempotentAndRemove(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestFirewall_DportValue is a portable check of the listed-rule parser
+// reconciliation relies on: it must find the port in iptables' normalised
+// listing (which inserts "-m tcp") and return "" for anything without one.
+func TestFirewall_DportValue(t *testing.T) {
+	fields := strings.Fields("-A FIREACTIONS-CACHE-GUARD -i fireactions-br0 -p tcp -m tcp --dport 8080 -j DROP")
+	assert.Equal(t, "8080", dportValue(fields))
+
+	assert.Empty(t, dportValue(strings.Fields("-A FIREACTIONS-CACHE-GUARD -j DROP")))
+	assert.Empty(t, dportValue(strings.Fields("-N FIREACTIONS-CACHE-GUARD")))
+	assert.Empty(t, dportValue(strings.Fields("--dport"))) // trailing flag with no value
+}
+
+// TestFirewall_GuardRules_ReinstallReconcilesStalePorts exercises the
+// WR-03 unclean-restart scenario: the chain survives a SIGKILL, the config
+// changes ports, and the next install must remove the old port's DROP rule
+// while keeping the new one — in both families. Requires root and Linux.
+func TestFirewall_GuardRules_ReinstallReconcilesStalePorts(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping: requires Linux (real iptables/netfilter)")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("skipping: requires root (CAP_NET_ADMIN) to mutate iptables")
+	}
+
+	originalChainName := guardChainName
+	guardChainName = "FIREACTIONS-CACHE-GUARD-TEST"
+	defer func() { guardChainName = originalChainName }()
+	defer func() { _ = removeGuardRules() }()
+
+	logger := zerolog.Nop()
+	iface := "lo"
+	stalePort := "65500"
+	newPort := "65501"
+
+	err := installGuardRules(&logger, iface, []string{stalePort})
+	require.NoError(t, err)
+
+	// Simulate the unclean restart: no removal, install again with the new
+	// port set.
+	err = installGuardRules(&logger, iface, []string{newPort})
+	require.NoError(t, err)
+
+	for _, proto := range guardProtocols() {
+		ipt, iptErr := iptables.New(iptables.IPFamily(proto))
+		require.NoError(t, iptErr)
+
+		staleRule := []string{"-i", iface, "-p", "tcp", "--dport", stalePort, "-j", "DROP"}
+		staleExists, staleErr := ipt.Exists("filter", guardChainName, staleRule...)
+		require.NoError(t, staleErr)
+		assert.False(t, staleExists, "want stale port's DROP rule removed (%s)", protocolName(proto))
+
+		assertGuardActive(t, proto, iface, newPort)
+	}
+}
+
 // assertGuardActive asserts the DROP rule and the INPUT jump exist in the
 // given netfilter family.
 func assertGuardActive(t *testing.T, proto iptables.Protocol, iface, port string) {

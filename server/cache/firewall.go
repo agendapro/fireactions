@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/rs/zerolog"
@@ -106,12 +107,82 @@ func installGuardRulesFamily(proto iptables.Protocol, iface string, ports []stri
 		}
 	}
 
+	if err := reconcileStalePortRules(ipt, proto, ports); err != nil {
+		return err
+	}
+
 	jumpRule := []string{"-j", guardChainName}
 	if err := ipt.InsertUnique("filter", "INPUT", 1, jumpRule...); err != nil {
 		return fmt.Errorf("firewall: installing jump rule (%s): %w", protocolName(proto), err)
 	}
 
 	return nil
+}
+
+// reconcileStalePortRules deletes guard-chain DROP rules whose destination
+// port is no longer in ports. An unclean shutdown leaves the chain behind
+// by design (SIGKILL bypasses removal), and a port change before the next
+// start would otherwise leave the old ports' DROP rules in place forever —
+// install only ever appends, and graceful removal deletes the whole chain
+// only when shutdown is actually reached. Concretely harmful when an
+// operator reassigns a previously guarded port to the cache's own
+// bind_address: guests would silently be unable to reach the cache while
+// the chain "looks correct" on inspection.
+//
+// Ordering is deliberate and fail-closed: the caller appends the desired
+// rules before this reconciliation removes stale ones, so the chain never
+// passes through a state weaker than either the old or the new config. The
+// whole chain is never flushed for the same reason — a pre-existing INPUT
+// jump from the unclean run would briefly point at an empty chain while
+// guests may be live.
+func reconcileStalePortRules(ipt *iptables.IPTables, proto iptables.Protocol, ports []string) error {
+	desired := make(map[string]struct{}, len(ports))
+	for _, port := range ports {
+		desired[port] = struct{}{}
+	}
+
+	rules, err := ipt.List("filter", guardChainName)
+	if err != nil {
+		return fmt.Errorf("firewall: listing guard chain (%s): %w", protocolName(proto), err)
+	}
+
+	for _, rule := range rules {
+		fields := strings.Fields(rule)
+		if len(fields) < 3 || fields[0] != "-A" {
+			// The "-N <chain>" header, or nothing rule-shaped.
+			continue
+		}
+
+		port := dportValue(fields)
+		if port == "" {
+			continue
+		}
+
+		if _, ok := desired[port]; ok {
+			continue
+		}
+
+		// fields[2:] is the listed rule's own rulespec (everything after
+		// "-A <chain>"), so the deletion matches exactly what exists on the
+		// host, whatever options iptables normalised into the listing.
+		if err := ipt.Delete("filter", guardChainName, fields[2:]...); err != nil {
+			return fmt.Errorf("firewall: removing stale drop rule for port %s (%s): %w", port, protocolName(proto), err)
+		}
+	}
+
+	return nil
+}
+
+// dportValue extracts the value following "--dport" from a listed rule's
+// fields, or "" when the rule has none.
+func dportValue(fields []string) string {
+	for i, field := range fields {
+		if field == "--dport" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+
+	return ""
 }
 
 // removeGuardRules removes the jump rule from INPUT and deletes the guard
