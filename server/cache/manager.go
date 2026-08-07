@@ -6,16 +6,16 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
 // Manager manages the lifecycle of the cache component: the single
-// path-routed HTTP listener that serves all cache kinds, guarded by a
-// dedicated firewall chain that blocks guest access to fireactions' own
-// ports. A later phase adds a bounded disk store on top of this same
-// Manager.
+// path-routed HTTP listener that serves all cache kinds, backed by a
+// bounded disk store and guarded by a dedicated firewall chain that
+// blocks guest access to fireactions' own ports.
 type Manager struct {
 	config         *Config
 	guardedPorts   []string
@@ -23,6 +23,7 @@ type Manager struct {
 	httpServer     *http.Server
 	listener       net.Listener
 	mux            *http.ServeMux
+	store          *Store
 	guardInstalled bool
 }
 
@@ -63,6 +64,7 @@ func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 		httpServer:     nil,
 		listener:       nil,
 		mux:            nil,
+		store:          nil,
 		guardInstalled: false,
 	}
 
@@ -85,12 +87,19 @@ func New(config *Config, guardedPorts []string, opts ...Opt) (*Manager, error) {
 }
 
 // Start performs the fallible setup required before the cache can serve
-// traffic. The firewall guard is installed first and gates everything
-// after it: if it cannot be installed, the cache never binds its listener
-// (D-07). Structured so that a later phase's disk store creation can be
-// inserted above the listen call without reordering: nothing may bind a
-// guest-reachable port before that step succeeds either.
+// traffic. The disk store is created first — it is the cheapest and least
+// destructive failure to check, so a bad data_dir never causes netfilter
+// mutations on the host. The firewall guard is installed next and gates
+// everything after it: if it cannot be installed, the cache never binds
+// its listener (D-07).
 func (m *Manager) Start(_ context.Context) error {
+	store, err := NewStore(m.logger, m.config.DataDir)
+	if err != nil {
+		return fmt.Errorf("cache: creating store: %w", err)
+	}
+
+	m.store = store
+
 	if err := installGuardRules(m.logger, bridgeInterface, m.guardedPorts); err != nil {
 		return fmt.Errorf("cache: installing firewall guard: %w", err)
 	}
@@ -170,6 +179,48 @@ func (m *Manager) buildMux() *http.ServeMux {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Reserved prefixes for the registry, Go module proxy, npm and friends
+	// stay unregistered here (D-05): this generic route must not shadow
+	// the real cache-kind path prefixes Phases 2-4 add.
+	mux.HandleFunc("GET /cache/{kind}/{key...}", m.handleCacheGet)
 
 	return mux
+}
+
+// handleCacheGet serves content out of the disk store. The response
+// headers are always set to a fixed, non-sniffable content type before
+// the body is written, so a cached artifact that happens to parse as
+// HTML can never be sniffed and rendered by a browser-like client.
+func (m *Manager) handleCacheGet(w http.ResponseWriter, r *http.Request) {
+	if m.store == nil {
+		// The mux is built in New, before Start creates the store — a
+		// request cannot normally arrive this early, but the handler must
+		// not dereference a nil store if one somehow does.
+		http.Error(w, "cache not ready", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	kind := r.PathValue("kind")
+	key := r.PathValue("key")
+
+	f, fi, err := m.store.Open(kind, key)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidKey):
+			http.Error(w, "invalid key", http.StatusBadRequest)
+		case errors.Is(err, os.ErrNotExist):
+			http.Error(w, "not found", http.StatusNotFound)
+		default:
+			m.logger.Error().Err(err).Str("kind", kind).Str("key", key).Msg("cache: serving content failed")
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
+
+		return
+	}
+	defer func() { _ = f.Close() }()
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, "", fi.ModTime(), f)
 }
