@@ -38,6 +38,7 @@ nav:
       - Images: user-guide/images.md
       - Kernels: user-guide/kernels.md
       - Metrics: user-guide/metrics.md
+      - Cache verification: user-guide/cache-verification.md
       - Upgrade Guide: user-guide/upgrade-guide.md
   - Reference:
       - Configuration: reference/configuration.md
