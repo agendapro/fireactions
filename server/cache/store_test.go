@@ -64,6 +64,8 @@ func TestStore_Path_InvalidKey(t *testing.T) {
 		{"absolute", "/etc/passwd"},
 		{"nul_byte", "a\x00b"},
 		{"hidden_segment", "a/.hidden/b"},
+		{"total_too_long", strings.TrimSuffix(strings.Repeat("ab/", 342), "/")}, // 1025 bytes
+		{"segment_too_long", "a/" + strings.Repeat("b", 256) + "/c"},            // 256-byte segment: ENAMETOOLONG territory
 	}
 
 	for _, tc := range cases {
@@ -104,6 +106,16 @@ func TestStore_Path_Valid(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, single, doubled)
+
+	// Boundary values: a NAME_MAX-sized segment and a 1024-byte total key
+	// are both still valid — the bounds reject only what the filesystem
+	// itself could never store.
+	_, err = s.Path("gomod", strings.Repeat("a", 255))
+	require.NoError(t, err)
+
+	exactly1024 := strings.Repeat("ab/", 341) + "a" // 341*3+1 = 1024 bytes
+	_, err = s.Path("gomod", exactly1024)
+	require.NoError(t, err)
 }
 
 func TestStore_PutOpen_RoundTrip(t *testing.T) {

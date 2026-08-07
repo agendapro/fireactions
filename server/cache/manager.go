@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -276,7 +277,11 @@ func (m *Manager) handleCacheGet(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, ErrInvalidKey):
 			http.Error(w, "invalid key", http.StatusBadRequest)
-		case errors.Is(err, os.ErrNotExist):
+		case errors.Is(err, os.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+			// ENOTDIR is a guest-shaped miss, not a server fault: any request
+			// whose path extends an existing file (…/hello.txt/extra) fails
+			// with it, and mapping it to 500 would let an untrusted guest
+			// flood host logs at Error level with ordinary requests.
 			http.Error(w, "not found", http.StatusNotFound)
 		default:
 			m.logger.Error().Err(err).Str("kind", kind).Str("key", key).Msg("cache: serving content failed")

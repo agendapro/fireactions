@@ -27,6 +27,20 @@ var ErrInvalidKey = errors.New("invalid key")
 // own reserved ".tmp-*" scratch-file prefix.
 var kindPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
+const (
+	// maxKeyLength bounds the total key length. Keys are guest-controlled;
+	// without a bound an over-long key turns into a filesystem
+	// ENAMETOOLONG at lookup time — an ordinary client-shaped request that
+	// must fail validation cleanly, not surface as an internal error.
+	maxKeyLength = 1024
+
+	// maxKeySegmentLength bounds a single key path segment to NAME_MAX
+	// (255 bytes on Linux): a longer segment can never exist on disk, so a
+	// lookup for one is invalid by construction — bounding it here keeps
+	// ENAMETOOLONG out of Open and Put entirely.
+	maxKeySegmentLength = 255
+)
+
 // Store is a bounded, disk-persistent key/value store rooted at a single
 // data directory. It has no upstream fetch path and accepts no credentials
 // (CORE-07): every method here is a plain filesystem operation scoped
@@ -72,18 +86,8 @@ func (s *Store) Path(kind, key string) (string, error) {
 		return "", fmt.Errorf("cache: store: invalid kind %q: %w", kind, ErrInvalidKey)
 	}
 
-	if key == "" || strings.ContainsRune(key, 0) {
-		return "", fmt.Errorf("cache: store: invalid key: %w", ErrInvalidKey)
-	}
-
-	if strings.HasPrefix(key, "/") {
-		return "", fmt.Errorf("cache: store: key %q must not be absolute: %w", key, ErrInvalidKey)
-	}
-
-	for _, seg := range strings.Split(key, "/") {
-		if strings.HasPrefix(seg, ".") {
-			return "", fmt.Errorf("cache: store: key %q has a segment beginning with \".\": %w", key, ErrInvalidKey)
-		}
+	if err := validateKey(key); err != nil {
+		return "", err
 	}
 
 	cleaned := path.Clean(key)
@@ -99,6 +103,36 @@ func (s *Store) Path(kind, key string) (string, error) {
 	}
 
 	return full, nil
+}
+
+// validateKey applies every raw-key check Path relies on: emptiness, NUL
+// bytes, length bounds, absoluteness, and per-segment shape. It runs on the
+// raw, uncleaned key (see Path's doc comment for why cleaning must come
+// after).
+func validateKey(key string) error {
+	if key == "" || strings.ContainsRune(key, 0) {
+		return fmt.Errorf("cache: store: invalid key: %w", ErrInvalidKey)
+	}
+
+	if len(key) > maxKeyLength {
+		return fmt.Errorf("cache: store: key exceeds %d bytes: %w", maxKeyLength, ErrInvalidKey)
+	}
+
+	if strings.HasPrefix(key, "/") {
+		return fmt.Errorf("cache: store: key %q must not be absolute: %w", key, ErrInvalidKey)
+	}
+
+	for _, seg := range strings.Split(key, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return fmt.Errorf("cache: store: key %q has a segment beginning with \".\": %w", key, ErrInvalidKey)
+		}
+
+		if len(seg) > maxKeySegmentLength {
+			return fmt.Errorf("cache: store: key has a segment exceeding %d bytes: %w", maxKeySegmentLength, ErrInvalidKey)
+		}
+	}
+
+	return nil
 }
 
 // Put stores the content read from r under kind/key, replacing any

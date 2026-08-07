@@ -286,6 +286,41 @@ func TestHandleCacheGet_MissingKey(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
+// TestHandleCacheGet_KeyExtendsExistingFile is the WR-05 regression check:
+// a request whose path extends an existing file fails the store lookup with
+// ENOTDIR, which is a guest-shaped miss and must map to 404 — not to 500
+// with an Error-level log line an untrusted guest can flood.
+func TestHandleCacheGet_KeyExtendsExistingFile(t *testing.T) {
+	m, store := newTestManagerWithStore(t)
+
+	require.NoError(t, store.Put("manual", "hello.txt", strings.NewReader("hello")))
+
+	srv := httptest.NewServer(m.mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/cache/manual/hello.txt/extra")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// TestHandleCacheGet_OverlongKeySegment is WR-05's other half: a path
+// segment over NAME_MAX would fail with ENAMETOOLONG at the filesystem —
+// Store.Path now rejects it up front, so the guest sees a clean 400.
+func TestHandleCacheGet_OverlongKeySegment(t *testing.T) {
+	m, _ := newTestManagerWithStore(t)
+
+	srv := httptest.NewServer(m.mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/cache/manual/" + strings.Repeat("a", 300))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 // TestHandleCacheGet_InvalidKind asserts an invalid key returns 400, not
 // 404 or 500 — an invalid kind fails Store.Path's kindPattern check.
 func TestHandleCacheGet_InvalidKind(t *testing.T) {
