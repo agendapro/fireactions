@@ -201,6 +201,14 @@ func (m *Manager) Run(ctx context.Context) error {
 	wg.Wait()
 
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// The cache is dead from here on (listener gone, sweep stopped) and
+		// nothing restarts it — the error may sit in the caller's errgroup
+		// until process shutdown, so the transition must be visible now:
+		// cache_up exists precisely to detect this condition, and leaving it
+		// at 1 would defeat its one job.
+		metricCacheUp.Set(0)
+		m.logger.Error().Err(err).Msg("Cache listener terminated unexpectedly")
+
 		return fmt.Errorf("cache: serve: %w", err)
 	}
 

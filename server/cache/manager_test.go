@@ -741,6 +741,45 @@ func TestManager_Run_SweepErrorDoesNotStopServing(t *testing.T) {
 	}
 }
 
+// TestManager_Run_AbnormalServeExitClearsCacheUp is the WR-04 regression
+// check, portable on any host: the listener is attached directly (bypassing
+// Start and the firewall guard) and then closed out from under Serve, which
+// makes it return a non-ErrServerClosed error. Run must clear cache_up on
+// that path — the error may sit unobserved in the caller's errgroup until
+// process shutdown, so the gauge is the only live signal that the cache
+// died.
+func TestManager_Run_AbnormalServeExitClearsCacheUp(t *testing.T) {
+	m, _ := newTestManagerWithStore(t)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	m.listener = listener
+	m.maxSizeBytes = 1 << 30
+	metricCacheUp.Set(1) // what a successful Start would have done
+
+	runErrCh := make(chan error, 1)
+
+	go func() {
+		runErrCh <- m.Run(context.Background())
+	}()
+
+	// Kill the listener out from under Serve: it returns a use-of-closed
+	// error regardless of whether Accept was already in flight.
+	require.NoError(t, listener.Close())
+
+	select {
+	case runErr := <-runErrCh:
+		require.Error(t, runErr)
+		assert.Contains(t, runErr.Error(), "cache: serve")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for Run to return after listener close")
+	}
+
+	assert.InDelta(t, float64(0), testutil.ToFloat64(metricCacheUp), 0,
+		"expected cache_up to be 0 after the serve loop died abnormally")
+}
+
 // TestManager_Metrics_CacheUp is 1 while running and 0 after Shutdown.
 // Requires root+Linux for a real Start.
 func TestManager_Metrics_CacheUp(t *testing.T) {
