@@ -9,6 +9,7 @@ import (
 	"time"
 
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
+	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
 	"github.com/hostinger/fireactions/server/backend"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
@@ -384,4 +385,211 @@ func TestPool_CreateMachine_ImageFailureDoesNotCallGitHub(t *testing.T) {
 	assert.Equal(t, 0, pool.GetCurrentSize())
 	assert.Equal(t, int32(0), fakeBE.createCalls.Load())
 	assert.Equal(t, int32(0), fakeGH.removeCalls.Load())
+}
+
+// TestPool_MachineExit_RemovesItFromThePoolAndCleansUp simulates the guest
+// exiting on its own (fakeMachine.Stop() unblocks the fake's Wait, exactly
+// like a real VM shutting down) and pins that the cleanup goroutine removes
+// the machine from the pool, deletes its GitHub runner registration, and
+// releases the backend-side resource — each exactly once.
+func TestPool_MachineExit_RemovesItFromThePoolAndCleansUp(t *testing.T) {
+	pool, fakeBE, fakeGH := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	require.NoError(t, pool.Scale(context.Background(), 1))
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	fm := fakeBE.lastMachine()
+	require.NotNil(t, fm)
+
+	require.NoError(t, fm.Stop())
+
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 0 &&
+			fm.cleanupCalls.Load() == 1 &&
+			fakeGH.removeCalls.Load() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+// TestPool_MachineExit_CleanupErrorDoesNotWedgeThePool pins that a
+// Machine.Cleanup error is logged, never fatal: the machine is still
+// removed from the pool's bookkeeping and the pool can scale back up
+// afterwards.
+func TestPool_MachineExit_CleanupErrorDoesNotWedgeThePool(t *testing.T) {
+	pool, fakeBE, _ := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	require.NoError(t, pool.Scale(context.Background(), 1))
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	fm := fakeBE.lastMachine()
+	require.NotNil(t, fm)
+	fm.cleanupErr = errors.New("cleanup: boom") // set before Stop() — no concurrent access
+
+	require.NoError(t, fm.Stop())
+
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, pool.Scale(context.Background(), 1))
+	assert.Eventually(t, func() bool {
+		return fakeBE.createCalls.Load() == 2
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
+// TestPool_Run_ScalesToDesiredReplicasAndStopsCleanly drives Run() through a
+// live goroutine: initial scale-to-replicas on start, a SetReplicas bump,
+// then a clean Stop() that lets Run() return.
+func TestPool_Run_ScalesToDesiredReplicasAndStopsCleanly(t *testing.T) {
+	fakeBE := &fakeBackend{dir: t.TempDir()}
+	fakeGH := &fakeGitHub{installationID: 1, jitConfig: "fake-jit-config"}
+
+	cfg := newTestPoolConfig(t)
+	cfg.Replicas = 1
+
+	logger := zerolog.Nop()
+	pool, err := NewPool(&logger, cfg, fakeGH, fakeBE)
+	require.NoError(t, err)
+
+	runDone := make(chan struct{})
+	go func() {
+		pool.Run()
+		close(runDone)
+	}()
+
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	pool.SetReplicas(2)
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	pool.Stop()
+
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for Run to return after Stop")
+	}
+}
+
+// TestPool_Stop_StopsEveryMachineAndDrainsCleanupBeforeReturning is the
+// cleanupWg-drained-before-return proof (T-05-21): asserting "eventually"
+// here would pass even if Stop returned while cleanup goroutines were still
+// running, which is exactly the bug worth catching. Every assertion below
+// runs synchronously, immediately after Stop() returns.
+func TestPool_Stop_StopsEveryMachineAndDrainsCleanupBeforeReturning(t *testing.T) {
+	fakeBE := &fakeBackend{dir: t.TempDir()}
+	fakeGH := &fakeGitHub{installationID: 1, jitConfig: "fake-jit-config"}
+
+	cfg := newTestPoolConfig(t)
+	cfg.Replicas = 2
+
+	logger := zerolog.Nop()
+	pool, err := NewPool(&logger, cfg, fakeGH, fakeBE)
+	require.NoError(t, err)
+
+	runDone := make(chan struct{})
+	go func() {
+		pool.Run()
+		close(runDone)
+	}()
+
+	// Setup wait (not the terminal-state proof below) — require.Eventually
+	// per TESTING.md's "require for setup that must abort" convention.
+	// Every assertion after Stop() returns is synchronous below, the only
+	// formulation that can catch a Stop() that returns before its cleanup
+	// goroutines finish.
+	require.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2
+	}, 2*time.Second, 10*time.Millisecond, "pool did not reach 2 replicas before Stop")
+
+	pool.Stop()
+
+	fakeBE.mu.Lock()
+	machines := append([]*fakeMachine(nil), fakeBE.machines...)
+	fakeBE.mu.Unlock()
+
+	require.Len(t, machines, 2)
+	for _, m := range machines {
+		assert.GreaterOrEqual(t, m.stopCalls.Load(), int32(1))
+		assert.Equal(t, int32(1), m.cleanupCalls.Load())
+	}
+	assert.Equal(t, 0, pool.GetCurrentSize())
+
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for Run to return after Stop")
+	}
+}
+
+// TestPool_PauseResume_TogglesActiveState is a pure state test with no Run
+// goroutine, so it stays outside D-06's isActive race entirely. It reads
+// the state through convertPoolToProto, exercising the same field the gRPC
+// surface reports rather than poking the raw struct field.
+func TestPool_PauseResume_TogglesActiveState(t *testing.T) {
+	pool, _, _ := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	ctx := context.Background()
+
+	assert.Equal(t, serverv1.PoolState_POOL_STATE_ACTIVE, convertPoolToProto(ctx, pool).State)
+
+	pool.Pause()
+	assert.Equal(t, serverv1.PoolState_POOL_STATE_PAUSED, convertPoolToProto(ctx, pool).State)
+
+	pool.Pause() // no-op
+	assert.Equal(t, serverv1.PoolState_POOL_STATE_PAUSED, convertPoolToProto(ctx, pool).State)
+
+	pool.Resume()
+	assert.Equal(t, serverv1.PoolState_POOL_STATE_ACTIVE, convertPoolToProto(ctx, pool).State)
+
+	pool.Resume() // no-op
+	assert.Equal(t, serverv1.PoolState_POOL_STATE_ACTIVE, convertPoolToProto(ctx, pool).State)
+}
+
+// TestPool_Run_PausedPoolDoesNotScale pauses the pool before starting Run()
+// (the only ordering that keeps isActive race-free per D-06), then proves
+// a paused pool ignores TriggerScale with a bounded negative wait. Resume()
+// is never called while Run is alive.
+func TestPool_Run_PausedPoolDoesNotScale(t *testing.T) {
+	fakeBE := &fakeBackend{dir: t.TempDir()}
+	fakeGH := &fakeGitHub{installationID: 1, jitConfig: "fake-jit-config"}
+
+	cfg := newTestPoolConfig(t)
+	cfg.Replicas = 1
+
+	logger := zerolog.Nop()
+	pool, err := NewPool(&logger, cfg, fakeGH, fakeBE)
+	require.NoError(t, err)
+
+	pool.Pause() // before Run starts
+
+	runDone := make(chan struct{})
+	go func() {
+		pool.Run()
+		close(runDone)
+	}()
+
+	pool.TriggerScale()
+
+	assert.Never(t, func() bool {
+		return fakeBE.createCalls.Load() != 0 || pool.GetCurrentSize() != 0
+	}, 300*time.Millisecond, 20*time.Millisecond)
+
+	pool.Stop()
+
+	select {
+	case <-runDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for Run to return after Stop")
+	}
 }
