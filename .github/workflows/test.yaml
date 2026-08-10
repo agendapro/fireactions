@@ -16,6 +16,10 @@ jobs:
       with:
         go-version: '1.25.6'
 
+    - name: Verify linux builds stay cgo-free
+      run: |
+        CGO_ENABLED=0 GOOS=linux go build ./...
+
     - name: Run tests
       run: |
         go test -v ./...
