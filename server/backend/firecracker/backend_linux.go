@@ -220,8 +220,10 @@ func (b *Backend) createSnapshot(ctx context.Context, image containerd.Image, sn
 // metadata delivery -> VMM start. ctx is the pool's lifetime context; the
 // VM's own VMM context is derived from it, matching today's
 // context.WithCancel(p.ctx) (Pool.Scale is only ever called with p.ctx). On
-// any failure the containerd lease taken for this VM is rolled back, so a
-// failed call leaves no host state behind.
+// any failure the containerd lease taken for this VM is rolled back; per-VM
+// files already created under the pool state directory (the machine log,
+// and after a Start failure the firecracker log, API socket and vsock UDS)
+// may survive the failed call.
 func (b *Backend) CreateMachine(ctx context.Context, spec backend.VMSpec, image backend.ImageRef) (backend.Machine, error) {
 	img, ok := image.(*imageRef)
 	if !ok {

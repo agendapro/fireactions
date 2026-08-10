@@ -139,7 +139,9 @@ type Backend interface {
 
 	// CreateMachine returns a started, running machine. The backend
 	// derives the VM's lifetime context from ctx (the pool's context) and
-	// rolls back everything it created if any step fails, so a failed
-	// call leaves no host state behind.
+	// rolls back the resource leases it took (e.g. the containerd lease)
+	// if any step fails. Per-VM files under the pool state directory may
+	// survive a failed call; ReconcileOrphans is the hook for reclaiming
+	// them.
 	CreateMachine(ctx context.Context, spec VMSpec, image ImageRef) (Machine, error)
 }
