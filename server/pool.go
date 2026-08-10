@@ -3,41 +3,23 @@ package server
 import (
 	"context"
 	"fmt"
-	"io"
-	"net"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/errdefs"
-	"github.com/containerd/log"
-	"github.com/firecracker-microvm/firecracker-go-sdk"
-	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
-	"github.com/hostinger/fireactions/helper/deepcopy"
 	"github.com/hostinger/fireactions/helper/github"
 	"github.com/hostinger/fireactions/helper/stringid"
-	"github.com/opencontainers/image-spec/identity"
+	"github.com/hostinger/fireactions/server/backend"
 	"github.com/rs/zerolog"
-	"github.com/sirupsen/logrus"
 
 	githubv63 "github.com/google/go-github/v63/github"
 )
 
-const (
-	defaultSnapshotter = "devmapper"
-)
-
-// Pool represents a pool of Firecracker VMs that are used to run GitHub Actions jobs.
+// Pool represents a pool of VMs that are used to run GitHub Actions jobs.
 type Pool struct {
 	config         *PoolConfig
-	containerd     *containerd.Client
+	backend        backend.Backend
 	github         *github.Client
-	imageManager   *imageManager
 	pendingCreates atomic.Int32
 	pendingDeletes atomic.Int32
 	machinesMu     *sync.Mutex
@@ -52,7 +34,7 @@ type Pool struct {
 	cleanupWg      sync.WaitGroup
 	ctx            context.Context
 	cancel         context.CancelFunc
-	nextCID        *atomic.Uint32
+	dir            string
 	l              *sync.Mutex
 }
 
@@ -81,7 +63,7 @@ func (p *PoolConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 // NewPool creates a new Pool.
-func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, imageManager *imageManager, containerdClient *containerd.Client, nextCID *atomic.Uint32) (*Pool, error) {
+func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, b backend.Backend) (*Pool, error) {
 	l := logger.With().Str("pool", config.Name).Logger()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -92,26 +74,33 @@ func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, 
 		machinesMu:   &sync.Mutex{},
 		machines:     make(map[string]*Machine),
 		isActive:     true,
-		containerd:   containerdClient,
+		backend:      b,
 		github:       github,
-		imageManager: imageManager,
 		logger:       &l,
 		scaleTrigger: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}, 1),
 		doneCh:       make(chan struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
-		nextCID:      nextCID,
 	}
 
 	p.replicas.Store(int32(config.Replicas))
 
-	if _, err := os.Stat(p.GetDir()); os.IsNotExist(err) {
-		if err := os.MkdirAll(p.GetDir(), 0755); err != nil {
-			return nil, fmt.Errorf("creating pool directory: %w", err)
-		}
+	dir, err := b.PrepareStateDir(config.Name)
+	if err != nil {
+		return nil, err
+	}
+	p.dir = dir
 
-		p.logger.Debug().Msgf("Pool directory created at %s", p.GetDir())
+	p.logger.Debug().Msgf("Pool directory created at %s", dir)
+
+	orphans, err := b.ReconcileOrphans(ctx, config.Name)
+	if err != nil {
+		return nil, fmt.Errorf("reconciling orphaned machine state: %w", err)
+	}
+
+	if len(orphans) > 0 {
+		p.logger.Info().Msgf("Reconciled %d orphaned machines", len(orphans))
 	}
 
 	metricPoolRunnersCurrent.
@@ -200,23 +189,26 @@ func (p *Pool) Stop() {
 
 	p.logger.Debug().Msgf("Stopping %d machines in pool %s", len(p.machines), p.config.Name)
 
+	type namedMachine struct {
+		name    string
+		machine *Machine
+	}
+
 	p.machinesMu.Lock()
-	machines := make([]*Machine, 0, len(p.machines))
-	for _, machine := range p.machines {
-		machines = append(machines, machine)
+	machines := make([]namedMachine, 0, len(p.machines))
+	for name, machine := range p.machines {
+		machines = append(machines, namedMachine{name: name, machine: machine})
 	}
 	p.machinesMu.Unlock()
 
 	// Stop all machines - cleanup goroutines will handle the rest
-	for _, machine := range machines {
-		runnerName := machine.Cfg.VMID
-
-		err := machine.StopVMM()
+	for _, nm := range machines {
+		err := nm.machine.Stop()
 		if err != nil {
-			p.logger.Error().Err(err).Msgf("Failed to stop Firecracker VM %s", runnerName)
+			p.logger.Error().Err(err).Msgf("Failed to stop VM %s", nm.name)
 		}
 
-		p.logger.Debug().Msgf("Stopped Firecracker VM %s", runnerName)
+		p.logger.Debug().Msgf("Stopped VM %s", nm.name)
 	}
 
 	cleanupDone := make(chan struct{})
@@ -234,9 +226,9 @@ func (p *Pool) Stop() {
 	p.logger.Debug().Msgf("Pool %s stopped", p.config.Name)
 }
 
-// GetDir returns the directory where the pool sockets and logs are stored.
+// GetDir returns the directory where the backend keeps this pool's per-VM state.
 func (p *Pool) GetDir() string {
-	return fmt.Sprintf("/var/lib/fireactions/pools/%s", p.config.Name)
+	return p.dir
 }
 
 // Scale scales the pool to the desired size.
@@ -408,88 +400,12 @@ func (p *Pool) GetMachine(name string) (*Machine, error) {
 }
 
 func (p *Pool) createMachine(ctx context.Context) error {
-	image, err := p.imageManager.ensureImage(
-		ctx,
-		p.config.Runner.Image,
-		p.config.Runner.ImagePullPolicy,
-	)
+	image, err := p.backend.EnsureImage(ctx, p.config.Runner.Image, p.config.Runner.ImagePullPolicy)
 	if err != nil {
 		return fmt.Errorf("ensuring image: %w", err)
 	}
 
 	runnerName := fmt.Sprintf("%s-%s", p.config.Runner.Name, stringid.New())
-
-	leaseCtx, leaseCtxCancel, err := p.containerd.WithLease(ctx,
-		leases.WithID(fmt.Sprintf("fireactions/pools/%s/%s", p.config.Name, runnerName)))
-	if err != nil {
-		return fmt.Errorf("containerd: creating lease: %w", err)
-	}
-
-	// Track if we successfully created the machine to determine cleanup responsibility
-	var machineCreated bool
-	defer func() {
-		if !machineCreated {
-			// Clean up lease if machine creation failed
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cleanupCancel()
-			_ = leaseCtxCancel(cleanupCtx)
-		}
-	}()
-
-	snapshotMounts, err := p.createSnapshot(leaseCtx, image, runnerName)
-	if err != nil {
-		return fmt.Errorf("containerd: creating snapshot: %w", err)
-	}
-
-	machineLogFile, err := os.Create(filepath.Join(p.GetDir(), fmt.Sprintf("%s.log", runnerName)))
-	if err != nil {
-		return fmt.Errorf("creating log file: %w", err)
-	}
-	defer machineLogFile.Close()
-
-	machineCmd := firecracker.VMCommandBuilder{}.
-		WithSocketPath(filepath.Join(p.GetDir(), fmt.Sprintf("%s.sock", runnerName))).
-		WithStderr(machineLogFile).
-		WithStdout(machineLogFile).
-		WithBin(p.config.Firecracker.BinaryPath).
-		Build(ctx)
-
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
-	logger.SetOutput(io.Discard)
-
-	vsockPath := filepath.Join(p.GetDir(), fmt.Sprintf("%s.vsock", runnerName))
-	vsockCID := p.nextCID.Add(1)
-
-	fcMachine, err := firecracker.NewMachine(ctx, firecracker.Config{
-		VMID:            runnerName,
-		SocketPath:      filepath.Join(p.GetDir(), fmt.Sprintf("%s.sock", runnerName)),
-		KernelImagePath: p.config.Firecracker.KernelImagePath,
-		KernelArgs:      p.config.Firecracker.KernelArgs,
-		MachineCfg: models.MachineConfiguration{
-			VcpuCount:  &p.config.Firecracker.MachineConfig.VcpuCount,
-			MemSizeMib: &p.config.Firecracker.MachineConfig.MemSizeMib,
-		},
-		Drives: []models.Drive{{
-			DriveID:      firecracker.String("rootfs"),
-			PathOnHost:   &snapshotMounts[0].Source,
-			IsRootDevice: firecracker.Bool(true),
-			IsReadOnly:   firecracker.Bool(false),
-		}},
-		NetworkInterfaces: []firecracker.NetworkInterface{{
-			AllowMMDS:        true,
-			CNIConfiguration: &firecracker.CNIConfiguration{NetworkName: "fireactions", IfName: "eth0", ConfDir: "/etc/cni/net.d", BinPath: []string{"/opt/cni/bin"}},
-		}},
-		VsockDevices:   []firecracker.VsockDevice{{Path: vsockPath, CID: vsockCID}},
-		MmdsAddress:    net.IPv4(169, 254, 169, 254),
-		MmdsVersion:    firecracker.MMDSv2,
-		ForwardSignals: []os.Signal{},
-		LogPath:        filepath.Join(p.GetDir(), fmt.Sprintf("%s.firecracker.log", runnerName)),
-		LogLevel:       "Debug",
-	}, firecracker.WithProcessRunner(machineCmd), firecracker.WithLogger(logrus.NewEntry(logger)))
-	if err != nil {
-		return fmt.Errorf("firecracker: creating machine: %w", err)
-	}
 
 	installationID := p.installationID.Load()
 	if installationID == 0 {
@@ -512,38 +428,39 @@ func (p *Pool) createMachine(ctx context.Context) error {
 		return fmt.Errorf("github: %w", err)
 	}
 
-	metadata := map[string]interface{}{"latest": map[string]interface{}{"meta-data": deepcopy.Map(p.config.Firecracker.Metadata)}}
-	metadata["latest"].(map[string]interface{})["meta-data"].(map[string]interface{})["fireactions"] = map[string]interface{}{
-		"runner_id":         runnerName,
-		"runner_jit_config": jitConfig.GetEncodedJITConfig(),
-		"hostname":          runnerName,
-		"shutdown_on_exit":  *p.config.ShutdownOnExit,
+	spec := backend.VMSpec{
+		Pool:           p.config.Name,
+		Name:           runnerName,
+		Hostname:       runnerName,
+		JITConfig:      jitConfig.GetEncodedJITConfig(),
+		ShutdownOnExit: *p.config.ShutdownOnExit,
+		VCPUCount:      p.config.Firecracker.MachineConfig.VcpuCount,
+		MemSizeMib:     p.config.Firecracker.MachineConfig.MemSizeMib,
+		Metadata:       p.config.Firecracker.Metadata,
+		Firecracker: backend.FirecrackerSpec{
+			BinaryPath:      p.config.Firecracker.BinaryPath,
+			KernelImagePath: p.config.Firecracker.KernelImagePath,
+			KernelArgs:      p.config.Firecracker.KernelArgs,
+		},
 	}
 
-	fcMachine.Handlers.FcInit = fcMachine.Handlers.FcInit.Append(firecracker.NewSetMetadataHandler(metadata))
-
-	vmmCtx, vmmCancel := context.WithCancel(p.ctx)
-	if err := fcMachine.Start(vmmCtx); err != nil {
-		vmmCancel()
-		return fmt.Errorf("firecracker: starting machine: %w", err)
+	// The backend already wraps CreateMachine errors with its own subsystem
+	// prefix (e.g. "firecracker: creating machine: %w"), so returning err
+	// unwrapped here keeps the message byte-identical to today's.
+	bm, err := p.backend.CreateMachine(p.ctx, spec, image)
+	if err != nil {
+		p.deleteGitHubRunner(runnerName, jitConfig.GetRunner().GetID())
+		return err
 	}
 
-	// Mark machine as successfully created
-	machineCreated = true
-
-	p.logger.Info().Msgf("Successfully created Firecracker VM %s", runnerName)
+	p.logger.Info().Msgf("Successfully created VM %s", runnerName)
 
 	machine := &Machine{
-		Machine:     fcMachine,
-		Name:        jitConfig.GetRunner().GetName(),
-		RunnerID:    jitConfig.GetRunner().GetID(),
-		Pool:        p.config.Name,
-		CreatedAt:   time.Now().UTC(),
-		vsockCID:    vsockCID,
-		vsockPath:   vsockPath,
-		leaseCancel: leaseCtxCancel,
-		vmmCtx:      vmmCtx,
-		vmmCancel:   vmmCancel,
+		Machine:   bm,
+		Name:      jitConfig.GetRunner().GetName(),
+		RunnerID:  jitConfig.GetRunner().GetID(),
+		Pool:      p.config.Name,
+		CreatedAt: time.Now().UTC(),
 	}
 
 	p.machinesMu.Lock()
@@ -579,18 +496,15 @@ func (p *Pool) createMachine(ctx context.Context) error {
 		}
 		p.machinesMu.Unlock()
 
-		machine.vmmCancel()
-
 		p.deleteGitHubRunner(runnerName, machine.RunnerID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		err := machine.leaseCancel(ctx)
-		if err != nil && !errdefs.IsNotFound(err) {
-			p.logger.Error().Err(err).Msgf("Failed to remove Containerd lease for Firecracker VM %s", runnerName)
+		if err := machine.Cleanup(ctx); err != nil {
+			p.logger.Error().Err(err).Msgf("Failed to clean up machine %s", runnerName)
 		}
 
-		p.logger.Info().Msgf("Successfully cleaned up exited Firecracker VM %s", runnerName)
+		p.logger.Info().Msgf("Successfully cleaned up exited VM %s", runnerName)
 	}()
 
 	return nil
@@ -618,7 +532,7 @@ func (p *Pool) deleteMachine(_ context.Context) error {
 	delete(p.machines, targetName)
 	p.machinesMu.Unlock()
 
-	err := targetMachine.StopVMM()
+	err := targetMachine.Stop()
 	if err != nil {
 		p.logger.Warn().Err(err).Msgf("Failed to stop VM %s", targetName)
 		return err
@@ -626,39 +540,6 @@ func (p *Pool) deleteMachine(_ context.Context) error {
 
 	p.logger.Info().Msgf("Successfully removed VM %s", targetName)
 	return nil
-}
-
-// createSnapshot creates a snapshot of the specified image.
-func (p *Pool) createSnapshot(ctx context.Context, image containerd.Image, snapshotID string) ([]mount.Mount, error) {
-	snapshotService := p.containerd.SnapshotService(defaultSnapshotter)
-	snapshotExists := true
-	_, err := snapshotService.Stat(ctx, snapshotID)
-	if err != nil {
-		if !errdefs.IsNotFound(err) {
-			return nil, err
-		}
-
-		snapshotExists = false
-	}
-
-	if !snapshotExists {
-		imageContent, err := image.RootFS(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("image: rootfs: %w", err)
-		}
-
-		_, err = snapshotService.Prepare(ctx, snapshotID, identity.ChainID(imageContent).String())
-		if err != nil {
-			return nil, fmt.Errorf("prepare: %w", err)
-		}
-	}
-
-	mounts, err := snapshotService.Mounts(ctx, snapshotID)
-	if err != nil {
-		return nil, fmt.Errorf("mounts: %w", err)
-	}
-
-	return mounts, nil
 }
 
 // deleteGitHubRunner removes a runner from GitHub Actions
@@ -684,8 +565,4 @@ func (p *Pool) deleteGitHubRunner(runnerName string, runnerID int64) {
 	}
 
 	p.logger.Debug().Msgf("Successfully deleted GitHub runner %s (ID: %d)", runnerName, runnerID)
-}
-
-func init() {
-	_ = log.SetLevel("panic")
 }
