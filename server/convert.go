@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/containerd/containerd"
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	"github.com/hostinger/fireactions/server/backend"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -34,7 +34,7 @@ func convertMachineToProto(ctx context.Context, machine *Machine) *serverv1.Mach
 	m := &serverv1.Machine{
 		ID:        machine.Name,
 		Pool:      machine.Pool,
-		Addr:      machine.GetAddr(),
+		Addr:      machine.Addr(),
 		CreatedAt: timestamppb.New(machine.CreatedAt),
 	}
 
@@ -68,15 +68,12 @@ func convertMachineToProto(ctx context.Context, machine *Machine) *serverv1.Mach
 	return m
 }
 
-// convertImageToProto converts a containerd Image to its protobuf representation.
-func convertImageToProto(ctx context.Context, img containerd.Image) *serverv1.Image {
-	size, _ := img.Size(ctx)
-	createdAt := img.Metadata().CreatedAt
-
+// convertImageToProto converts a backend Image to its protobuf representation.
+func convertImageToProto(img backend.Image) *serverv1.Image {
 	i := &serverv1.Image{
-		Name:      img.Name(),
-		Size:      size,
-		CreatedAt: timestamppb.New(createdAt),
+		Name:      img.Name,
+		Size:      img.Size,
+		CreatedAt: timestamppb.New(img.CreatedAt),
 	}
 
 	return i

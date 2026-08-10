@@ -7,12 +7,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// server.New requires a live containerd socket (containerd.New is called
-// unconditionally), so it cannot be exercised here without one. The
-// nil-cacheManager behavior it wires up is asserted indirectly below, through
-// the two building blocks New's cache-construction branch actually depends
-// on: guardedPorts (port derivation) and the config.Cache != nil &&
-// config.Cache.Enabled predicate that gates whether cache.New is even called.
+// server.New no longer dials containerd directly — the backend registry
+// (server/backend/registry) does, behind registry.New — but constructing a
+// Server still requires a live containerd socket on linux (registry.New
+// returns an error on other platforms), so it cannot be exercised here
+// without one. The nil-cacheManager behavior it wires up is asserted
+// indirectly below, through the two building blocks New's cache-construction
+// branch actually depends on: guardedPorts (port derivation) and the
+// config.Cache != nil && config.Cache.Enabled predicate that gates whether
+// cache.New is even called.
 
 func TestGuardedPorts(t *testing.T) {
 	tests := []struct {

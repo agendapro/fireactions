@@ -220,14 +220,14 @@ func (s *Server) GetMachineLogs(req *serverv1.GetMachineLogsRequest, stream serv
 
 // ListImages implements ServerService.ListImages.
 func (s *Server) ListImages(ctx context.Context, req *serverv1.ListImagesRequest) (*serverv1.ListImagesResponse, error) {
-	images, err := s.imageManager.listImages(ctx)
+	images, err := s.backend.ListImages(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list images: %v", err)
 	}
 
 	protoImages := make([]*serverv1.Image, len(images))
 	for i, img := range images {
-		protoImages[i] = convertImageToProto(ctx, img)
+		protoImages[i] = convertImageToProto(img)
 	}
 
 	return &serverv1.ListImagesResponse{Images: protoImages}, nil
@@ -235,7 +235,7 @@ func (s *Server) ListImages(ctx context.Context, req *serverv1.ListImagesRequest
 
 // RemoveImage implements ServerService.RemoveImage.
 func (s *Server) RemoveImage(ctx context.Context, req *serverv1.RemoveImageRequest) (*serverv1.RemoveImageResponse, error) {
-	if err := s.imageManager.removeImage(ctx, req.Name); err != nil {
+	if err := s.backend.RemoveImage(ctx, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal, "remove image: %v", err)
 	}
 

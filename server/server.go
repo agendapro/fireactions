@@ -6,13 +6,13 @@ import (
 	"net"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/containerd/containerd"
 	"github.com/hostinger/fireactions"
 	"github.com/hostinger/fireactions/helper/github"
 	serverv1 "github.com/hostinger/fireactions/proto/server/v1"
+	"github.com/hostinger/fireactions/server/backend"
+	"github.com/hostinger/fireactions/server/backend/registry"
 	"github.com/hostinger/fireactions/server/cache"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
@@ -30,12 +30,10 @@ type Server struct {
 	metricsServer *http.Server
 	cacheManager  *cache.Manager
 	github        *github.Client
-	containerd    *containerd.Client
-	imageManager  *imageManager
+	backend       backend.Backend
 	l             *sync.Mutex
 	logger        *zerolog.Logger
-	nextCID       atomic.Uint32 // Global VSOCK CID counter (starts at 3)
-	version       string        // Version info for GetVersion RPC
+	version       string // Version info for GetVersion RPC
 	commit        string
 	date          string
 }
@@ -92,12 +90,6 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 
 	logger := zerolog.Nop()
 
-	containerdClient, err := containerd.New(config.Containerd.Address,
-		containerd.WithTimeout(5*time.Second), containerd.WithDefaultNamespace(config.Containerd.Namespace))
-	if err != nil {
-		return nil, fmt.Errorf("containerd: creating client: %w", err)
-	}
-
 	// Create gRPC server with interceptors
 	grpcServer := grpc.NewServer(
 	// TODO: Add auth interceptor for BasicAuth if config.BasicAuthEnabled
@@ -109,7 +101,6 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 		grpcServer: grpcServer,
 		pools:      make(map[string]*Pool),
 		github:     github,
-		containerd: containerdClient,
 		l:          &sync.Mutex{},
 		logger:     &logger,
 		version:    fireactions.Version,
@@ -117,14 +108,19 @@ func New(config *Config, opts ...Opt) (*Server, error) {
 		date:       fireactions.Date,
 	}
 
-	// Initialize CID counter (CID 2 is reserved for host, start at 3)
-	s.nextCID.Store(2)
-
 	for _, opt := range opts {
 		opt(s)
 	}
 
-	s.imageManager = newImageManager(s.logger, containerdClient)
+	b, err := registry.New(
+		registry.WithLogger(s.logger),
+		registry.WithStateDirRoot(backend.DefaultStateDirRoot),
+		registry.WithContainerd(config.Containerd.Address, config.Containerd.Namespace),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("backend: %w", err)
+	}
+	s.backend = b
 
 	// Register gRPC service
 	serverv1.RegisterServerServiceServer(grpcServer, s)
@@ -180,7 +176,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	for _, poolConfig := range s.config.Pools {
-		pool, err := NewPool(s.logger, poolConfig, s.github, s.imageManager, s.containerd, &s.nextCID)
+		pool, err := NewPool(s.logger, poolConfig, s.github, s.backend)
 		if err != nil {
 			return fmt.Errorf("creating pool: %w", err)
 		}
