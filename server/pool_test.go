@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	agentv1 "github.com/hostinger/fireactions/proto/agent/v1"
 	"github.com/hostinger/fireactions/server/backend"
@@ -274,4 +275,113 @@ func TestPool_TriggerScale_IsNonBlockingAndCoalesces(t *testing.T) {
 	pool.TriggerScale()
 
 	assert.Equal(t, 1, len(pool.scaleTrigger))
+}
+
+// TestPool_Scale_CreatesMachinesThroughBackend pins that scaling up creates
+// machines exclusively through the backend fake: every VM Pool creates is
+// observed as an EnsureImage + CreateMachine call, never a host-side effect.
+func TestPool_Scale_CreatesMachinesThroughBackend(t *testing.T) {
+	pool, fakeBE, _ := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	require.NoError(t, pool.Scale(context.Background(), 2))
+
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, int32(2), fakeBE.createCalls.Load())
+	assert.Equal(t, int32(2), fakeBE.ensureCalls.Load())
+}
+
+// TestPool_Scale_IsIdempotentAtDesiredSize pins the delta == 0 early exit:
+// scaling to an already-reached size must not create any further machines.
+func TestPool_Scale_IsIdempotentAtDesiredSize(t *testing.T) {
+	pool, fakeBE, _ := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	require.NoError(t, pool.Scale(context.Background(), 2))
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, pool.Scale(context.Background(), 2))
+
+	assert.Never(t, func() bool {
+		return fakeBE.createCalls.Load() != 2
+	}, 300*time.Millisecond, 20*time.Millisecond)
+}
+
+// TestPool_Scale_ScaleDownStopsAndRemovesAMachine pins that scaling down
+// stops exactly one machine (deleteMachine picks an arbitrary map entry by
+// design, so we assert "exactly one," never "which one").
+func TestPool_Scale_ScaleDownStopsAndRemovesAMachine(t *testing.T) {
+	pool, fakeBE, _ := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	require.NoError(t, pool.Scale(context.Background(), 2))
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2
+	}, 2*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, pool.Scale(context.Background(), 1))
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	fakeBE.mu.Lock()
+	stopped := 0
+	for _, m := range fakeBE.machines {
+		if m.stopCalls.Load() == 1 {
+			stopped++
+		}
+	}
+	fakeBE.mu.Unlock()
+
+	assert.Equal(t, 1, stopped)
+}
+
+// TestPool_CreateMachine_BackendFailureDeletesTheOrphanRunner pins the
+// compensation for accepted-delta 1 (05-04): JIT config is generated before
+// the VM exists, so a CreateMachine failure must delete the GitHub runner
+// registration it already created, or the pool leaks it on every scale tick.
+func TestPool_CreateMachine_BackendFailureDeletesTheOrphanRunner(t *testing.T) {
+	pool, fakeBE, fakeGH := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	fakeBE.createErr = errors.New("backend: create machine: boom")
+
+	require.NoError(t, pool.Scale(context.Background(), 1))
+
+	assert.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 0 && fakeGH.removeCalls.Load() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	fakeGH.mu.Lock()
+	removed := append([]int64(nil), fakeGH.removed...)
+	fakeGH.mu.Unlock()
+
+	require.Len(t, removed, 1)
+	assert.Equal(t, fakeGH.runnerID.Load(), removed[0])
+}
+
+// TestPool_CreateMachine_ImageFailureDoesNotCallGitHub pins the step order
+// inside createMachine: image first, GitHub second, VM third. An image
+// failure must short-circuit before either GitHub or the backend VM create
+// path is reached.
+func TestPool_CreateMachine_ImageFailureDoesNotCallGitHub(t *testing.T) {
+	pool, fakeBE, fakeGH := newTestPool(t)
+	t.Cleanup(func() { pool.cancel() })
+
+	fakeBE.ensureErr = errors.New("backend: ensure image: boom")
+
+	require.NoError(t, pool.Scale(context.Background(), 1))
+
+	assert.Eventually(t, func() bool {
+		return pool.pendingCreates.Load() == 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, 0, pool.GetCurrentSize())
+	assert.Equal(t, int32(0), fakeBE.createCalls.Load())
+	assert.Equal(t, int32(0), fakeGH.removeCalls.Load())
 }
