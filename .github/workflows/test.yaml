@@ -20,6 +20,11 @@ jobs:
       run: |
         CGO_ENABLED=0 GOOS=linux go build ./...
 
+    - name: Verify the server package builds on non-linux (backend seam)
+      run: |
+        GOOS=darwin GOARCH=arm64 go build ./server/...
+        ! GOOS=darwin go list -deps ./server | grep -E 'firecracker-microvm|containerd/'
+
     - name: Run tests
       run: |
         go test -v ./...
