@@ -287,8 +287,8 @@ func TestPool_Scale_CreatesMachinesThroughBackend(t *testing.T) {
 
 	require.NoError(t, pool.Scale(context.Background(), 2))
 
-	assert.Eventually(t, func() bool {
-		return pool.GetCurrentSize() == 2
+	require.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2 && pool.pendingCreates.Load() == 0
 	}, 2*time.Second, 10*time.Millisecond)
 
 	assert.Equal(t, int32(2), fakeBE.createCalls.Load())
@@ -301,9 +301,12 @@ func TestPool_Scale_IsIdempotentAtDesiredSize(t *testing.T) {
 	pool, fakeBE, _ := newTestPool(t)
 	t.Cleanup(func() { pool.cancel() })
 
+	// Settle on pendingCreates too: GetCurrentSize()==2 alone races the
+	// deferred pendingCreates decrement in scaleUp, and a second Scale
+	// landing in that window would see a stale effectiveSize.
 	require.NoError(t, pool.Scale(context.Background(), 2))
-	assert.Eventually(t, func() bool {
-		return pool.GetCurrentSize() == 2
+	require.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2 && pool.pendingCreates.Load() == 0
 	}, 2*time.Second, 10*time.Millisecond)
 
 	require.NoError(t, pool.Scale(context.Background(), 2))
@@ -321,8 +324,8 @@ func TestPool_Scale_ScaleDownStopsAndRemovesAMachine(t *testing.T) {
 	t.Cleanup(func() { pool.cancel() })
 
 	require.NoError(t, pool.Scale(context.Background(), 2))
-	assert.Eventually(t, func() bool {
-		return pool.GetCurrentSize() == 2
+	require.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 2 && pool.pendingCreates.Load() == 0
 	}, 2*time.Second, 10*time.Millisecond)
 
 	require.NoError(t, pool.Scale(context.Background(), 1))
@@ -397,8 +400,8 @@ func TestPool_MachineExit_RemovesItFromThePoolAndCleansUp(t *testing.T) {
 	t.Cleanup(func() { pool.cancel() })
 
 	require.NoError(t, pool.Scale(context.Background(), 1))
-	assert.Eventually(t, func() bool {
-		return pool.GetCurrentSize() == 1
+	require.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 1 && pool.pendingCreates.Load() == 0
 	}, 2*time.Second, 10*time.Millisecond)
 
 	fm := fakeBE.lastMachine()
@@ -422,8 +425,8 @@ func TestPool_MachineExit_CleanupErrorDoesNotWedgeThePool(t *testing.T) {
 	t.Cleanup(func() { pool.cancel() })
 
 	require.NoError(t, pool.Scale(context.Background(), 1))
-	assert.Eventually(t, func() bool {
-		return pool.GetCurrentSize() == 1
+	require.Eventually(t, func() bool {
+		return pool.GetCurrentSize() == 1 && pool.pendingCreates.Load() == 0
 	}, 2*time.Second, 10*time.Millisecond)
 
 	fm := fakeBE.lastMachine()
