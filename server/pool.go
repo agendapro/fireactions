@@ -7,19 +7,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hostinger/fireactions/helper/github"
 	"github.com/hostinger/fireactions/helper/stringid"
 	"github.com/hostinger/fireactions/server/backend"
 	"github.com/rs/zerolog"
-
-	githubv63 "github.com/google/go-github/v63/github"
 )
 
 // Pool represents a pool of VMs that are used to run GitHub Actions jobs.
 type Pool struct {
 	config         *PoolConfig
 	backend        backend.Backend
-	github         *github.Client
+	github         githubAPI
 	pendingCreates atomic.Int32
 	pendingDeletes atomic.Int32
 	machinesMu     *sync.Mutex
@@ -63,7 +60,7 @@ func (p *PoolConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 // NewPool creates a new Pool.
-func NewPool(logger *zerolog.Logger, config *PoolConfig, github *github.Client, b backend.Backend) (*Pool, error) {
+func NewPool(logger *zerolog.Logger, config *PoolConfig, github githubAPI, b backend.Backend) (*Pool, error) {
 	l := logger.With().Str("pool", config.Name).Logger()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -409,21 +406,16 @@ func (p *Pool) createMachine(ctx context.Context) error {
 
 	installationID := p.installationID.Load()
 	if installationID == 0 {
-		installation, _, err := p.github.Apps.FindOrganizationInstallation(ctx, p.config.Runner.Organization)
+		id, err := p.github.FindOrganizationInstallation(ctx, p.config.Runner.Organization)
 		if err != nil {
 			return fmt.Errorf("github: %w", err)
 		}
-		installationID = installation.GetID()
+		installationID = id
 
 		p.installationID.Store(installationID)
 	}
 
-	client := p.github.Installation(installationID)
-	jitConfig, _, err := client.Actions.GenerateOrgJITConfig(ctx, p.config.Runner.Organization, &githubv63.GenerateJITConfigRequest{
-		Name:          runnerName,
-		RunnerGroupID: p.config.Runner.GroupID,
-		Labels:        p.config.Runner.Labels,
-	})
+	jitConfig, runnerID, jitRunnerName, err := p.github.GenerateOrgJITConfig(ctx, installationID, p.config.Runner.Organization, runnerName, p.config.Runner.GroupID, p.config.Runner.Labels)
 	if err != nil {
 		return fmt.Errorf("github: %w", err)
 	}
@@ -432,7 +424,7 @@ func (p *Pool) createMachine(ctx context.Context) error {
 		Pool:           p.config.Name,
 		Name:           runnerName,
 		Hostname:       runnerName,
-		JITConfig:      jitConfig.GetEncodedJITConfig(),
+		JITConfig:      jitConfig,
 		ShutdownOnExit: *p.config.ShutdownOnExit,
 		VCPUCount:      p.config.Firecracker.MachineConfig.VcpuCount,
 		MemSizeMib:     p.config.Firecracker.MachineConfig.MemSizeMib,
@@ -449,7 +441,7 @@ func (p *Pool) createMachine(ctx context.Context) error {
 	// unwrapped here keeps the message byte-identical to today's.
 	bm, err := p.backend.CreateMachine(p.ctx, spec, image)
 	if err != nil {
-		p.deleteGitHubRunner(runnerName, jitConfig.GetRunner().GetID())
+		p.deleteGitHubRunner(runnerName, runnerID)
 		return err
 	}
 
@@ -457,8 +449,8 @@ func (p *Pool) createMachine(ctx context.Context) error {
 
 	machine := &Machine{
 		Machine:   bm,
-		Name:      jitConfig.GetRunner().GetName(),
-		RunnerID:  jitConfig.GetRunner().GetID(),
+		Name:      jitRunnerName,
+		RunnerID:  runnerID,
 		Pool:      p.config.Name,
 		CreatedAt: time.Now().UTC(),
 	}
@@ -554,11 +546,10 @@ func (p *Pool) deleteGitHubRunner(runnerName string, runnerID int64) {
 		return
 	}
 
-	client := p.github.Installation(p.installationID.Load())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err := client.Actions.RemoveOrganizationRunner(ctx, p.config.Runner.Organization, runnerID)
+	err := p.github.RemoveOrganizationRunner(ctx, p.installationID.Load(), p.config.Runner.Organization, runnerID)
 	if err != nil {
 		p.logger.Error().Err(err).Msgf("Failed to delete GitHub runner %s (ID: %d)", runnerName, runnerID)
 		return

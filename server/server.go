@@ -176,7 +176,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	for _, poolConfig := range s.config.Pools {
-		pool, err := NewPool(s.logger, poolConfig, s.github, s.backend)
+		pool, err := NewPool(s.logger, poolConfig, newGitHubAppClient(s.github), s.backend)
 		if err != nil {
 			return fmt.Errorf("creating pool: %w", err)
 		}
